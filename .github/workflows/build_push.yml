@@ -134,9 +134,8 @@ jobs:
           # Create index
           python ./.github/scripts/create-repo.py
           
-          # Generate repository icon
-          sudo apt-get update && sudo apt-get install -y librsvg2-bin
-          rsvg-convert -w 512 -h 512 repo_logo.svg -o repo/icon.png
+          # Copy repository icon
+          cp repo_logo.png repo/icon.png
           
           # Create repo.json for Komikku compatibility
           SAMPLE_APK=$(find repo/apk -name "*.apk" | head -n 1)
