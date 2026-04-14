@@ -119,19 +119,16 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          path: main
 
       - name: Create repo artifacts
         run: |
-          cd main
           python ./.github/scripts/move-built-apks.py
           
           # Use Keiyoushi inspector
           INSPECTOR_LINK="$(curl -s "https://api.github.com/repos/keiyoushi/extensions-inspector/releases/latest" | jq -r '.assets[0].browser_download_url')"
           curl -L "$INSPECTOR_LINK" -o ./Inspector.jar
           
-          # The move-built-apks.py script already creates a 'repo' folder
+          # move-built-apks.py script creates a 'repo' folder
           java -jar ./Inspector.jar "repo/apk" "output.json" "tmp"
           
           # Create index
@@ -156,6 +153,6 @@ jobs:
         uses: JamesIves/github-pages-deploy-action@v4
         with:
           branch: repo
-          folder: main/repo
+          folder: repo
           clean: true
           commit-message: "Update extension repo: ${{ needs.prepare.outputs.latestCommitMessage }}"
