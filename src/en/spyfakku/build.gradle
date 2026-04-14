@@ -1,9 +1,0 @@
-ext {
-    kmkVersionCode = 1
-    extName = 'SpyFakku'
-    extClass = '.SpyFakku'
-    extVersionCode = 13
-    isNsfw = true
-}
-
-apply from: "$rootDir/common.gradle"

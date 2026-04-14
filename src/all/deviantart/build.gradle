@@ -1,9 +1,0 @@
-ext {
-    kmkVersionCode = 1
-    extName = 'DeviantArt'
-    extClass = '.DeviantArt'
-    extVersionCode = 9
-    isNsfw = true
-}
-
-apply from: "$rootDir/common.gradle"

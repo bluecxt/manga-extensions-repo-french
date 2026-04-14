@@ -1,9 +1,0 @@
-ext {
-    kmkVersionCode = 1
-    extName = 'Atsumaru'
-    extClass = '.Atsumaru'
-    extVersionCode = 14
-    isNsfw = true
-}
-
-apply from: "$rootDir/common.gradle"
