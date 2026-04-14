@@ -48,7 +48,7 @@ jobs:
       - id: generate-matrices
         name: Create output matrices
         run: |
-          python ./.github/scripts/generate-build-matrices.py "HEAD~1" Release
+          python ./.github/scripts/generate-build-matrices.py "all" Release
 
   build:
     name: Build extensions (${{ matrix.chunk.number }})
