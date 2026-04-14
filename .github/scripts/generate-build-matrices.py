@@ -197,9 +197,47 @@ def get_all_modules() -> tuple[list[str], list[str]]:
             deleted.append(f"{lang.name}.{extension.name}")
     return modules, deleted
 
+def filter_modules(modules: list[str]) -> list[str]:
+    try:
+        with open("exclude_build.json", "r") as f:
+            exclude_patterns = json.load(f)
+    except FileNotFoundError:
+        return modules
+
+    filtered = []
+    for module in modules:
+        # module format: :src:lang:extension
+        # we want to match against: lang.extension
+        parts = module.split(':')
+        if len(parts) < 4:
+            filtered.append(module)
+            continue
+        
+        lang_ext = f"{parts[2]}.{parts[3]}"
+        
+        should_exclude = False
+        for pattern in exclude_patterns:
+            # Simple glob-like matching for "all.*" or "en.*"
+            if pattern.endswith(".*"):
+                prefix = pattern[:-2]
+                if lang_ext.startswith(prefix + "."):
+                    should_exclude = True
+                    break
+            elif lang_ext == pattern:
+                should_exclude = True
+                break
+        
+        if not should_exclude:
+            filtered.append(module)
+    
+    return filtered
+
 def main() -> NoReturn:
     _, ref, build_type = sys.argv
     modules, deleted = get_module_list(ref)
+    
+    # Filter modules based on exclude_build.json
+    modules = filter_modules(modules)
 
     chunked = {
         "chunk": [

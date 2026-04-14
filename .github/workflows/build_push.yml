@@ -119,49 +119,25 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          path: main
-
-      - name: Checkout repo branch
-        uses: actions/checkout@v4
-        with:
-          ref: repo
-          path: repo
-        continue-on-error: true
-
-      - name: Initialize repo branch if not exists
-        run: |
-          if [ ! -d "repo" ]; then
-            mkdir repo
-            cd repo
-            git init
-            git checkout -b repo
-            cd ..
-          fi
 
       - name: Create repo artifacts
         run: |
-          cd main
           python ./.github/scripts/move-built-apks.py
           
           # Use Keiyoushi inspector
           INSPECTOR_LINK="$(curl -s "https://api.github.com/repos/keiyoushi/extensions-inspector/releases/latest" | jq -r '.assets[0].browser_download_url')"
           curl -L "$INSPECTOR_LINK" -o ./Inspector.jar
           
-          # Move artifacts to repo folder
-          mkdir -p ../repo/apk
-          cp -r repo/apk/* ../repo/apk/
-          
-          java -jar ./Inspector.jar "../repo/apk" "../repo/output.json" "tmp"
+          # The move-built-apks.py script already creates a 'repo' folder
+          java -jar ./Inspector.jar "repo/apk" "repo/output.json" "tmp"
           
           # Create index
           python ./.github/scripts/create-repo.py
-          cp repo/index.min.json ../repo/index.min.json
 
       - name: Deploy to repo branch
         uses: JamesIves/github-pages-deploy-action@v4
         with:
           branch: repo
           folder: repo
-          clean: false
+          clean: true
           commit-message: "Update extension repo: ${{ needs.prepare.outputs.latestCommitMessage }}"
