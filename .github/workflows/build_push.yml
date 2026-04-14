@@ -58,6 +58,8 @@ jobs:
     if: ${{ toJson(fromJson(needs.prepare.outputs.matrix).chunk) != '[]' }}
     strategy:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -74,9 +76,7 @@ jobs:
           cache-read-only: ${{ matrix.chunk.number > 1 }}
 
       - name: Prepare signing key
-        if: ${{ secrets.SIGNING_KEY != '' }}
-        env:
-          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        if: ${{ env.SIGNING_KEY != '' }}
         run: |
           echo "$SIGNING_KEY" | base64 -d > signingkey.jks
 
