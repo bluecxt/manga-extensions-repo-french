@@ -129,7 +129,7 @@ jobs:
           curl -L "$INSPECTOR_LINK" -o ./Inspector.jar
           
           # The move-built-apks.py script already creates a 'repo' folder
-          java -jar ./Inspector.jar "repo/apk" "repo/output.json" "tmp"
+          java -jar ./Inspector.jar "repo/apk" "output.json" "tmp"
           
           # Create index
           python ./.github/scripts/create-repo.py
