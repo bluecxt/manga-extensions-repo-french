@@ -1,0 +1,9 @@
+ext {
+    kmkVersionCode = 1
+    extName = 'Photos18'
+    extClass = '.Photos18'
+    extVersionCode = 6
+    isNsfw = true
+}
+
+apply from: "$rootDir/common.gradle"

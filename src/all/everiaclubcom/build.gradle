@@ -1,0 +1,9 @@
+ext {
+    kmkVersionCode = 1
+    extName = 'EveriaClub (unoriginal)'
+    extClass = '.EveriaClubCom'
+    extVersionCode = 1
+    isNsfw = true
+}
+
+apply from: "$rootDir/common.gradle"
