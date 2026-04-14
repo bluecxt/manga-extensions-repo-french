@@ -12,10 +12,11 @@ on:
   # Manual trigger
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  contents: write
 
 concurrency:
-  group: ${{ github.workflow }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -32,11 +33,10 @@ jobs:
       matrix: ${{ steps.generate-matrices.outputs.matrix }}
       delete: ${{ steps.generate-matrices.outputs.delete }}
     steps:
-      - name: Checkout ${{ github.ref_name }} branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
 
       - name: Set env
         id: set-env
@@ -45,16 +45,10 @@ jobs:
           $(git log -1 --pretty=%B)
           {delimiter}" >> $GITHUB_OUTPUT
 
-      - name: Get last successful CI commit
-        uses: nrwl/nx-set-shas@afb73a62d26e41464e9254689e1fd6122ee683c1 # v5.0.1
-        with:
-          main-branch-name: ${{ github.ref_name }}
-          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904 # empty tree
-
       - id: generate-matrices
         name: Create output matrices
         run: |
-          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release
+          python ./.github/scripts/generate-build-matrices.py "HEAD~1" Release
 
   build:
     name: Build extensions (${{ matrix.chunk.number }})
@@ -65,25 +59,26 @@ jobs:
     strategy:
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
-      - name: Checkout ${{ github.ref_name }} branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          persist-credentials: false
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Java
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        uses: actions/setup-java@v4
         with:
           java-version: 17
           distribution: temurin
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@50e97c2cd7a37755bbfafc9c5b7cafaece252f6e # v6.1.0
+        uses: gradle/actions/setup-gradle@v3
         with:
           cache-read-only: ${{ matrix.chunk.number > 1 }}
 
       - name: Prepare signing key
+        if: ${{ secrets.SIGNING_KEY != '' }}
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
         run: |
-          echo ${{ secrets.SIGNING_KEY }} | base64 -d > signingkey.jks
+          echo "$SIGNING_KEY" | base64 -d > signingkey.jks
 
       - name: Build extensions (${{ matrix.chunk.number }})
         env:
@@ -95,88 +90,78 @@ jobs:
           ./gradlew $MODULES
 
       - name: Upload APKs (${{ matrix.chunk.number }})
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: github.repository == '${{ github.repository }}'
+        uses: actions/upload-artifact@v4
         with:
           name: "individual-apks-${{ matrix.chunk.number }}"
           path: "**/*.apk"
           retention-days: 1
 
       - name: Clean up CI files
-        run: rm signingkey.jks
+        if: always()
+        run: rm -f signingkey.jks
 
   publish:
     name: Publish extension repo
     needs: [prepare, build]
-    if: github.repository == '${{ github.repository }}'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Download APK artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@v4
         with:
           path: ~/apk-artifacts
 
       - name: Set up JDK
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        uses: actions/setup-java@v4
         with:
           java-version: 17
           distribution: temurin
 
-      - name: Checkout ${{ github.ref_name }} branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
-          path: ${{ github.ref_name }}
-          persist-credentials: false
+          path: main
+
+      - name: Checkout repo branch
+        uses: actions/checkout@v4
+        with:
+          ref: repo
+          path: repo
+        continue-on-error: true
+
+      - name: Initialize repo branch if not exists
+        run: |
+          if [ ! -d "repo" ]; then
+            mkdir repo
+            cd repo
+            git init
+            git checkout -b repo
+            cd ..
+          fi
 
       - name: Create repo artifacts
         run: |
-          cd ${{ github.ref_name }}
+          cd main
           python ./.github/scripts/move-built-apks.py
+          
+          # Use Keiyoushi inspector
           INSPECTOR_LINK="$(curl -s "https://api.github.com/repos/keiyoushi/extensions-inspector/releases/latest" | jq -r '.assets[0].browser_download_url')"
           curl -L "$INSPECTOR_LINK" -o ./Inspector.jar
-          java -jar ./Inspector.jar "repo/apk" "output.json" "tmp"
+          
+          # Move artifacts to repo folder
+          mkdir -p ../repo/apk
+          cp -r repo/apk/* ../repo/apk/
+          
+          java -jar ./Inspector.jar "../repo/apk" "../repo/output.json" "tmp"
+          
+          # Create index
           python ./.github/scripts/create-repo.py
+          cp repo/index.min.json ../repo/index.min.json
 
-      - name: Checkout repo branch
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Deploy to repo branch
+        uses: JamesIves/github-pages-deploy-action@v4
         with:
-          repository: bluecxt/manga-extensions-repo-french
-          token: ${{ secrets.BOT_PAT }}
-          ref: repo
-          path: repo
-          persist-credentials: true
-
-      - name: Merge repo
-        env:
-          DELETE: ${{ needs.prepare.outputs.delete }}
-        run: |
-          cd repo
-          python ../${{ github.ref_name }}/.github/scripts/merge-repo.py "$DELETE" '${{ github.ref_name }}/repo'
-
-      - name: Deploy repo
-        uses: EndBug/add-and-commit@290ea2c423ad77ca9c62ae0f5b224379612c0321 # v10
-        with:
-          message: "${{ needs.prepare.outputs.latestCommitMessage }}"
-          cwd: "./repo"
-          # committer_name: github-actions[bot]
-          # committer_email: github-actions[bot]@users.noreply.github.com
-
-      - name: Sync repo
-        env:
-          COMMIT_MESSAGE: ${{ needs.prepare.outputs.latestCommitMessage }}
-        run: |
-          cd repo
-          git config user.name "Yūzōnō"
-          git config user.email "yuzono@users.noreply.github.com"
-          git remote set-url origin https://github.com/yuzono/manga-repo.git
-          git fetch origin
-          git reset origin/repo
-          git add -A
-          git commit --amend -m "$COMMIT_MESSAGE" --no-sign --allow-empty || echo "No changes to commit"
-          git push origin HEAD:repo --force
-
-      - name: Purge cached index on jsDelivr
-        run: |
-          curl https://purge.jsdelivr.net/gh/yuzono/manga-repo@repo/index.min.json
+          branch: repo
+          folder: repo
+          clean: false
+          commit-message: "Update extension repo: ${{ needs.prepare.outputs.latestCommitMessage }}"
