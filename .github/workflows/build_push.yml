@@ -119,9 +119,12 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          path: main
 
       - name: Create repo artifacts
         run: |
+          cd main
           python ./.github/scripts/move-built-apks.py
           
           # Use Keiyoushi inspector
@@ -133,11 +136,21 @@ jobs:
           
           # Create index
           python ./.github/scripts/create-repo.py
+          
+          # Create repo.json for Komikku compatibility
+          SAMPLE_APK=$(find repo/apk -name "*.apk" | head -n 1)
+          if [ -n "$SAMPLE_APK" ]; then
+            FINGERPRINT=$(keytool -printcert -jarfile "$SAMPLE_APK" | grep "SHA256:" | head -n 1 | awk -F': ' '{print $2}' | sed 's/://g' | tr '[:upper:]' '[:lower:]')
+            echo "{\"meta\":{\"name\":\"bluecxt French Extensions\",\"shortName\":\"BCXT-FR\",\"website\":\"https://github.com/${{ github.repository }}\",\"signingKeyFingerprint\":\"$FINGERPRINT\"}}" > repo/repo.json
+            echo "Successfully generated repo.json"
+          else
+            echo "Warning: No APK found to extract fingerprint!"
+          fi
 
       - name: Deploy to repo branch
         uses: JamesIves/github-pages-deploy-action@v4
         with:
           branch: repo
-          folder: repo
+          folder: main/repo
           clean: true
           commit-message: "Update extension repo: ${{ needs.prepare.outputs.latestCommitMessage }}"
