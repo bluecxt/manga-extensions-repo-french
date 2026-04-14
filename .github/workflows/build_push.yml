@@ -3,12 +3,10 @@ name: CI
 on:
   push:
     branches:
-      # - main
-      - master
+      - main
     paths:
       - '**'
       - '!**.md'
-      - '!.github/**'
       - '.github/scripts/**'
       - '.github/workflows/build_push.yml'
   # Manual trigger
