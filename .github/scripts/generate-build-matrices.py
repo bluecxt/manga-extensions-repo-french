@@ -242,13 +242,19 @@ def main() -> NoReturn:
     # Filter modules based on exclude_build.json
     modules = filter_modules(modules)
 
+    # Calculate balanced chunk size
+    total_modules = len(modules)
+    chunk_size_limit = int(os.getenv("CI_CHUNK_SIZE", 65))
+    num_chunks = (total_modules + chunk_size_limit - 1) // chunk_size_limit
+    balanced_chunk_size = (total_modules + num_chunks - 1) // num_chunks if num_chunks > 0 else chunk_size_limit
+
     chunked = {
         "chunk": [
-            {"number": i + 1, "modules": modules}
-            for i, modules in
+            {"number": i + 1, "modules": chunk_modules}
+            for i, chunk_modules in
             enumerate(itertools.batched(
                 map(lambda x: f"{x}:assemble{build_type}", modules),
-                int(os.getenv("CI_CHUNK_SIZE", 65))
+                balanced_chunk_size
             ))
         ]
     }
