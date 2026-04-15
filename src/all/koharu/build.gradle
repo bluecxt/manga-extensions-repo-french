@@ -1,9 +1,0 @@
-ext {
-    kmkVersionCode = 1
-    extName = 'SchaleNetwork'
-    extClass = '.KoharuFactory'
-    extVersionCode = 17
-    isNsfw = true
-}
-
-apply from: "$rootDir/common.gradle"
