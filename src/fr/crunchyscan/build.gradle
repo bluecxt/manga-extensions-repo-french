@@ -1,9 +1,8 @@
 ext {
     extName = 'CrunchyScan'
     extClass = '.CrunchyScan'
-    themePkg = 'madara'
     baseUrl = 'https://cdn.crunchyscan.fr'
-    overrideVersionCode = 1
+    extVersionCode = 1
     isNsfw = false
 }
 
