@@ -264,29 +264,42 @@ class CrunchyScan : ParsedHttpSource() {
 
                 val artistList = content["illustrator"]?.jsonArray ?: content["editor"]?.jsonArray
                 artist = artistList?.joinToString { it.jsonObject["name"]?.jsonPrimitive?.content ?: "" }
-
-                return@apply
             } catch (e: Exception) {
                 Log.e("CrunchyScan", "Error parsing JSON-LD", e)
             }
         }
 
-        // Fallback to Jsoup
-        title = document.selectFirst("h1")?.text() ?: ""
-        description = document.select("div.mt-12.max-h-48 p, div.flex.flex-col.gap-2.mt-5 > p, div#description, p#synopsis").joinToString("\n") { it.text() }.trim()
-        thumbnail_url = document.selectFirst("img.manga_cover, img.manga-cover, img.rounded.object-cover")?.let {
-            it.absUrl("data-src").ifEmpty { it.absUrl("src") }
+        // Fallback to Jsoup or supplement data (like status which is not in JSON-LD)
+        if (title.isNullOrBlank()) {
+            title = document.selectFirst("h1")?.text() ?: ""
         }
-        genre = document.select("h3[aria-label*='genre' i] + div a, div.flex.flex-wrap.gap-2 > a[href*='genre']").joinToString { it.text() }
-        status = when (document.selectFirst("h3[aria-label*='Status' i] + p, span.px-2.py-1.rounded-md.text-xs:contains(Statut)")?.text()?.trim()) {
-            "En cours" -> SManga.ONGOING
-            "Terminé" -> SManga.COMPLETED
-            "En pause" -> SManga.ON_HIATUS
-            "Abandonné" -> SManga.CANCELLED
+        if (description.isNullOrBlank()) {
+            description = document.select("div.mt-12.max-h-48 p, div.flex.flex-col.gap-2.mt-5 > p, div#description, p#synopsis").joinToString("\n") { it.text() }.trim()
+        }
+        if (thumbnail_url.isNullOrBlank()) {
+            thumbnail_url = document.selectFirst("img.manga_cover, img.manga-cover, img.rounded.object-cover")?.let {
+                it.absUrl("data-src").ifEmpty { it.absUrl("src") }
+            }
+        }
+        if (genre.isNullOrBlank()) {
+            genre = document.select("h3[aria-label*='genre' i] + div a, div.flex.flex-wrap.gap-2 > a[href*='genre']").joinToString { it.text() }
+        }
+
+        val statusText = document.selectFirst("div:has(> h3:contains(Status)) > p, h3:contains(Status) + p")?.text()?.trim()
+        status = when {
+            statusText?.equals("En cours", ignoreCase = true) == true -> SManga.ONGOING
+            statusText?.equals("Terminé", ignoreCase = true) == true -> SManga.COMPLETED
+            statusText?.equals("En pause", ignoreCase = true) == true -> SManga.ON_HIATUS
+            statusText?.equals("Abandonné", ignoreCase = true) == true -> SManga.CANCELLED
             else -> SManga.UNKNOWN
         }
-        author = document.select("h3[aria-label*='auteur' i] + div a, p:contains(Auteur) + p, span:contains(Auteur) + span").joinToString { it.text() }.ifEmpty { null }
-        artist = document.select("h3[aria-label*='artiste' i] + div a, p:contains(Artiste) + p, span:contains(Artiste) + span").joinToString { it.text() }.ifEmpty { null }
+
+        if (author.isNullOrBlank()) {
+            author = document.select("h3[aria-label*='auteur' i] + div a, p:contains(Auteur) + p, span:contains(Auteur) + span").joinToString { it.text() }.ifEmpty { null }
+        }
+        if (artist.isNullOrBlank()) {
+            artist = document.select("h3[aria-label*='artiste' i] + div a, p:contains(Artiste) + p, span:contains(Artiste) + span").joinToString { it.text() }.ifEmpty { null }
+        }
     }
 
     override fun relatedMangaListParse(response: Response): List<SManga> = emptyList()
@@ -301,7 +314,7 @@ class CrunchyScan : ParsedHttpSource() {
             try {
                 val content = json.parseToJsonElement(jsonLd).jsonObject
                 val parts = content["hasPart"]?.jsonArray
-                if (parts != null) {
+                if (parts != null && parts.isNotEmpty()) {
                     return parts.map {
                         val part = it.jsonObject
                         SChapter.create().apply {
@@ -327,7 +340,13 @@ class CrunchyScan : ParsedHttpSource() {
                 Log.e("CrunchyScan", "Error parsing chapters JSON-LD", e)
             }
         }
-        return super.chapterListParse(response)
+
+        val chapters = document.select(chapterListSelector())
+        if (chapters.isEmpty()) {
+            return emptyList()
+        }
+
+        return chapters.map { chapterFromElement(it) }
     }
 
     override fun chapterListSelector() = "div#ChapterWrap a.chapter-link, div#ChapterWrap a.flex.bg-secondary"

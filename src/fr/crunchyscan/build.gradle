@@ -2,7 +2,7 @@ ext {
     extName = 'CrunchyScan'
     extClass = '.CrunchyScan'
     baseUrl = 'https://cdn.crunchyscan.fr'
-    extVersionCode = 1
+    extVersionCode = 2
     isNsfw = false
 }
 
