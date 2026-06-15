@@ -5,7 +5,6 @@ import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.asObservableSuccess
-import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -14,6 +13,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.network.rateLimit
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
@@ -48,9 +48,8 @@ class MangaFire(
     override val supportsLatest = true
     private val preferences by getPreferencesLazy()
 
-    override val client = network.cloudflareClient.newBuilder()
+    override val client = network.client.newBuilder()
         .addInterceptor(ImageInterceptor)
-        .rateLimit(2)
         .apply {
             val naiveTrustManager =
                 @SuppressLint("CustomX509TrustManager")
@@ -68,6 +67,7 @@ class MangaFire(
             sslSocketFactory(insecureSocketFactory, naiveTrustManager)
             hostnameVerifier { _, _ -> true }
         }
+        .rateLimit(2)
         .build()
 
     override fun headersBuilder() = super.headersBuilder()
@@ -196,8 +196,8 @@ class MangaFire(
 
     override fun getFilterList() = FilterList(
         TypeFilter(),
-        GenreFilter(),
         GenreModeFilter(),
+        GenreFilter(),
         StatusFilter(),
         YearFilter(),
         MinChapterFilter(),
@@ -226,6 +226,23 @@ class MangaFire(
 
                 selectFirst("h6")?.let { it: Element ->
                     append("\n\nAlternative title: ${it.text()}")
+                }
+
+                val minInfo = selectFirst(".min-info")
+                minInfo?.selectFirst("a[href*=/type/]")?.text()?.trim()?.takeIf { it.isNotBlank() }?.let {
+                    append("\nType: $it")
+                }
+                selectFirst(".meta span:contains(Published) + span")?.text()?.trim()?.takeIf { it.isNotBlank() }?.let {
+                    append("\nPublished: $it")
+                }
+                selectFirst(".meta span:contains(Mangazine) + span")?.text()?.trim()?.takeIf { it.isNotBlank() }?.let {
+                    append("\nMagazines: $it")
+                }
+                minInfo?.selectFirst("span:has(b:contains(MAL))")?.text()?.replace(" MAL", "")?.trim()?.takeIf { it.isNotBlank() }?.let {
+                    append("\nMAL Score: $it")
+                }
+                minInfo?.selectFirst(".fa-folder-bookmark")?.parent()?.text()?.trim()?.takeIf { it.isNotBlank() }?.let {
+                    append("\nBookmarks: $it")
                 }
             }.trim()
 

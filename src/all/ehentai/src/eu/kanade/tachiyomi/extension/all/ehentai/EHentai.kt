@@ -341,7 +341,15 @@ abstract class EHentai(
         return MangasPage(listOf(details), false)
     }
 
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> = if (query.startsWith(PREFIX_ID_SEARCH)) {
+    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> = if (query.startsWith("https://")) {
+        val url = query.toHttpUrl()
+        if (url.pathSegments.size < 3) {
+            throw Exception("Unsupported url")
+        }
+        val id = url.pathSegments[1]
+        val key = url.pathSegments[2]
+        fetchSearchManga(page, "${PREFIX_ID_SEARCH}$id/$key", filters)
+    } else if (query.startsWith(PREFIX_ID_SEARCH)) {
         val id = query.removePrefix(PREFIX_ID_SEARCH)
         client.newCall(searchMangaByIdRequest(id))
             .asObservableSuccess()
@@ -475,7 +483,7 @@ abstract class EHentai(
         AdvancedGroup(),
     )
 
-    internal open class TextFilter(name: String, val type: String, val specific: String = "") : Filter.Text(name)
+    internal open class TextFilter(name: String, val type: String, val specific: String = "") : Text(name)
 
     class Watched :
         CheckBox("Watched List"),

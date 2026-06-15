@@ -3,8 +3,8 @@ ext {
     extClass = '.Mangakakalot'
     themePkg = 'mangabox'
     baseUrl = 'https://www.mangakakalot.gg'
-    overrideVersionCode = 7
+    overrideVersionCode = 8
     isNsfw = true
 }
 
-apply from: "$rootDir/common.gradle"
+apply plugin: "kei.plugins.extension.legacy"

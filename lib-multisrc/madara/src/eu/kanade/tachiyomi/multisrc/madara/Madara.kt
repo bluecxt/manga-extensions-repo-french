@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.lib.cryptoaes.CryptoAES
 import keiyoushi.lib.i18n.Intl
+import keiyoushi.utils.decodeHex
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -42,8 +43,6 @@ abstract class Madara(
 ) : HttpSource() {
 
     override val supportsLatest = true
-
-    override val client = network.cloudflareClient
 
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
@@ -239,13 +238,19 @@ abstract class Madara(
     }
 
     // load more
-    protected fun loadMoreRequest(page: Int, popular: Boolean): Request {
+    protected open fun loadMoreRequest(page: Int, popular: Boolean): Request {
         val formBody = FormBody.Builder().apply {
             add("action", "madara_load_more")
             add("page", (page - 1).toString())
             add("template", "madara-core/content/content-archive")
             add("vars[orderby]", "meta_value_num")
             add("vars[paged]", "1")
+
+            if (filterNonMangaItems) {
+                add("vars[meta_query][0][key]", "_wp_manga_chapter_type")
+                add("vars[meta_query][0][value]", "manga")
+            }
+
             add("vars[post_type]", "wp-manga")
             add("vars[post_status]", "publish")
             add("vars[meta_key]", if (popular) "_wp_manga_views" else "_latest_update")
@@ -1158,15 +1163,6 @@ abstract class Madara(
                 li.selectFirst("input[type=checkbox]")!!.`val`(),
             )
         }
-
-    // https://stackoverflow.com/a/66614516
-    protected fun String.decodeHex(): ByteArray {
-        check(length % 2 == 0) { "Must have an even length" }
-
-        return chunked(2)
-            .map { it.toInt(16).toByte() }
-            .toByteArray()
-    }
 
     protected val salted = "Salted__".toByteArray(Charsets.UTF_8)
 
