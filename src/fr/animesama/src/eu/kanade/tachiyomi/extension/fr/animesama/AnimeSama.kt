@@ -217,14 +217,41 @@ class AnimeSama : HttpSource() {
 
     private fun parseChapterFromResponse(response: Response, translationName: String): List<SChapter> {
         val document = response.asJsoup()
-        val title = document.select("#titreOeuvre").textNodes().firstOrNull()?.wholeText?.trim() ?: ""
+        val originalTitle = document.select("#titreOeuvre").textNodes().firstOrNull()?.wholeText ?: ""
+
+        val titlesToTry = listOf(
+            originalTitle,
+            originalTitle.trim() + " pp",
+            originalTitle.trim(),
+        ).distinct()
+
+        var apiNbChapImgJson: Map<String, Int>? = null
+        var successfulTitle: String = originalTitle
+
+        for (title in titlesToTry) {
+            val chapterUrl = "$baseUrl/s2/scans/get_nb_chap_et_img.php".toHttpUrl()
+                .newBuilder()
+                .addQueryParameter("oeuvre", title)
+                .build()
+            try {
+                val res = client.newCall(GET(chapterUrl, headers)).execute()
+                val body = res.body.string()
+                if (!body.contains("error")) {
+                    apiNbChapImgJson = Json.decodeFromString<Map<String, Int>>(body)
+                    successfulTitle = title
+                    break
+                }
+            } catch (e: Exception) {
+                // Continue to next title
+            }
+        }
+
+        if (apiNbChapImgJson == null) return emptyList()
+
         val chapterUrl = "$baseUrl/s2/scans/get_nb_chap_et_img.php".toHttpUrl()
             .newBuilder()
-            .addQueryParameter("oeuvre", title)
+            .addQueryParameter("oeuvre", successfulTitle)
             .build()
-
-        val apiNbChapImgResponse = client.newCall(GET(chapterUrl, headers)).execute()
-        val apiNbChapImgJson = Json.decodeFromString<Map<String, Int>>(apiNbChapImgResponse.body.string())
 
         val parsedChapterList = mutableListOf<SChapter>()
         var chapterDelay = 0
@@ -243,7 +270,7 @@ class AnimeSama : HttpSource() {
                             parsedChapterList.add(
                                 SChapter.create().apply {
                                     name = "Chapitre $i"
-                                    setUrlWithoutDomain(chapterUrl.newBuilder().addQueryParameter("id", (parsedChapterList.size + 1).toString()).addQueryParameter("title", title).build().toString())
+                                    setUrlWithoutDomain(chapterUrl.newBuilder().addQueryParameter("id", (parsedChapterList.size + 1).toString()).addQueryParameter("title", successfulTitle).build().toString())
                                     scanlator = translationName
                                 },
                             )
@@ -255,7 +282,7 @@ class AnimeSama : HttpSource() {
                         parsedChapterList.add(
                             SChapter.create().apply {
                                 name = "Chapitre $chapterName"
-                                setUrlWithoutDomain(chapterUrl.newBuilder().addQueryParameter("id", (parsedChapterList.size + 1).toString()).addQueryParameter("title", title).build().toString())
+                                setUrlWithoutDomain(chapterUrl.newBuilder().addQueryParameter("id", (parsedChapterList.size + 1).toString()).addQueryParameter("title", successfulTitle).build().toString())
                                 scanlator = translationName
                             },
                         )
@@ -269,7 +296,7 @@ class AnimeSama : HttpSource() {
             parsedChapterList.add(
                 SChapter.create().apply {
                     name = "Chapitre ${parsedChapterList.size + 1 - chapterDelay}"
-                    setUrlWithoutDomain(chapterUrl.newBuilder().addQueryParameter("id", (parsedChapterList.size + 1).toString()).addQueryParameter("title", title).build().toString())
+                    setUrlWithoutDomain(chapterUrl.newBuilder().addQueryParameter("id", (parsedChapterList.size + 1).toString()).addQueryParameter("title", successfulTitle).build().toString())
                     scanlator = translationName
                 },
             )
@@ -293,7 +320,10 @@ class AnimeSama : HttpSource() {
             .build()
 
         val apiNbChapImgResponse = client.newCall(GET(chapterUrl, headers)).execute()
-        val apiNbChapImgJson = Json.decodeFromString<Map<String, Int>>(apiNbChapImgResponse.body.string())
+        val responseBody = apiNbChapImgResponse.body.string()
+        if (responseBody.contains("error")) return emptyList()
+
+        val apiNbChapImgJson = Json.decodeFromString<Map<String, Int>>(responseBody)
         val imageCount = apiNbChapImgJson[chapter] ?: 0
 
         return (1..imageCount).map { index ->
