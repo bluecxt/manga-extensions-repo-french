@@ -1,0 +1,156 @@
+name: Surveillance des dépôts parents
+
+on:
+  schedule:
+    - cron: '0 0 * * 0' # Tous les dimanches à minuit
+  workflow_dispatch: # Permet de lancer manuellement
+
+jobs:
+  check-updates:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restauration de la date de dernière vérification
+        uses: actions/cache/restore@v4
+        with:
+          path: .last_run
+          key: last-update-check-${{ github.run_id }}
+          restore-keys: |
+            last-update-check-
+
+      - name: Setup Git Remotes
+        run: |
+          git remote add yuzono https://github.com/yuzono/tachiyomi-extensions.git
+          git remote add cursed https://github.com/yuzono/cursed-manga-extensions.git
+          git fetch --all --quiet
+
+      - name: Analyse des mises à jour
+        id: analyze
+        run: |
+          # Déterminer la date de début (soit le cache, soit 7 jours par défaut)
+          if [ -f .last_run ]; then
+            SINCE=$(cat .last_run)
+            echo "Comparaison depuis la dernière exécution : $SINCE"
+          else
+            SINCE="7 days ago"
+            echo "Première exécution, comparaison sur 7 jours."
+          fi
+          
+          # Liste des composants existants localement pour filtrer le bruit
+          COMPONENTS=$(find src/all src/fr src/en lib lib-multisrc -maxdepth 1 -mindepth 1 -type d 2>/dev/null)
+          
+          REPORT=""
+          REMOTES_WITH_UPDATES=""
+          DATE_NOW=$(date +'%Y-%m-%d %H:%M:%S')
+          DATE_DISPLAY=$(date +'%d/%m/%Y')
+          
+          get_component_name() {
+            local path=$1
+            if [[ $path =~ ^src/(all|fr|en)/([^/]+) ]]; then
+              echo "src/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+            elif [[ $path =~ ^lib/([^/]+) ]]; then
+              echo "lib/${BASH_REMATCH[1]}"
+            elif [[ $path =~ ^lib-multisrc/([^/]+) ]]; then
+              echo "lib-multisrc/${BASH_REMATCH[1]}"
+            else
+              echo ""
+            fi
+          }
+
+          process_remote() {
+            local name=$1
+            local branch=$2
+            local base_url=$3
+            
+            # Récupérer les commits depuis la dernière exécution
+            local LOG_DATA=$(git log $name/$branch --since="$SINCE" --pretty=format:"COMMIT|%H|%s" --name-only)
+            
+            if [ -z "$LOG_DATA" ]; then
+              return
+            fi
+            
+            local REMOTE_HAS_UPDATES=false
+            local CURRENT_COMMIT_HASH=""
+            local CURRENT_COMMIT_MSG=""
+            
+            # Utilisation d'un répertoire temporaire pour grouper par composant
+            mkdir -p "temp_$name"
+            
+            while IFS= read -r line; do
+              if [[ $line =~ ^COMMIT\|([^\|]+)\|(.*) ]]; then
+                CURRENT_COMMIT_HASH="${BASH_REMATCH[1]}"
+                CURRENT_COMMIT_MSG="${BASH_REMATCH[2]}"
+              elif [[ -n $line ]]; then
+                COMPONENT=$(get_component_name "$line")
+                if [[ -n $COMPONENT ]] && echo "$COMPONENTS" | grep -q "^$COMPONENT$"; then
+                  echo "- [$CURRENT_COMMIT_MSG]($base_url/commit/$CURRENT_COMMIT_HASH)" >> "temp_$name/${COMPONENT//\//_}"
+                  REMOTE_HAS_UPDATES=true
+                fi
+              fi
+            done <<< "$LOG_DATA"
+
+            
+            if [ "$REMOTE_HAS_UPDATES" = true ]; then
+              REMOTES_WITH_UPDATES+="$name "
+              REPORT+="\n## Source : $name\n"
+              # Lister les composants par ordre alphabétique
+              for f in $(ls temp_$name | sort); do
+                local real_name=$(echo "$f" | sed 's/_/\//g')
+                REPORT+="\n### $real_name\n"
+                # Supprimer les doublons de commits pour un même composant
+                sort -u "temp_$name/$f" >> "temp_sorted" 2>/dev/null || sort -u "temp_$name/$f" >> "temp_sorted"
+                REPORT+="$(cat temp_sorted)\n"
+                rm temp_sorted
+              done
+            fi
+            rm -rf "temp_$name"
+          }
+
+          process_remote "yuzono" "master" "https://github.com/yuzono/tachiyomi-extensions"
+          process_remote "cursed" "master" "https://github.com/yuzono/cursed-manga-extensions"
+
+          # Sauvegarder la date actuelle pour la prochaine fois
+          echo "$DATE_NOW" > .last_run
+
+          if [ ! -z "$REMOTES_WITH_UPDATES" ]; then
+            echo "updates_found=true" >> $GITHUB_OUTPUT
+            {
+              echo 'report<<EOF'
+              echo -e "$REPORT"
+              echo 'EOF'
+            } >> $GITHUB_OUTPUT
+            echo "remotes=$(echo $REMOTES_WITH_UPDATES | xargs | sed 's/ /, /g')" >> $GITHUB_OUTPUT
+            echo "date=$DATE_DISPLAY" >> $GITHUB_OUTPUT
+          else
+            echo "updates_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sauvegarde de la date dans le cache
+        uses: actions/cache/save@v4
+        with:
+          path: .last_run
+          key: last-update-check-${{ github.run_id }}
+
+      - name: Création de l'Issue
+        if: steps.analyze.outputs.updates_found == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const report = `${{ steps.analyze.outputs.report }}`;
+            const remotes = "${{ steps.analyze.outputs.remotes }}";
+            const date = "${{ steps.analyze.outputs.date }}";
+            const title = `Mises à jour disponibles : ${date} [${remotes}]`;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: report,
+              labels: ['synchronisation']
+            });
