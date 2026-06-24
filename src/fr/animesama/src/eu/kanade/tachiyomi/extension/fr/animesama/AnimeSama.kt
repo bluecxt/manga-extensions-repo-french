@@ -124,7 +124,7 @@ class AnimeSama : HttpSource() {
 
         return SManga.create().apply {
             description = document.select("#sousBlocMiddle > div h2:contains(Synopsis)+p").text()
-            genre = document.select("#sousBlocMiddle > div h2:contains(Genres)+a").text()
+            genre = document.select(".genre-pill").joinToString { it.text() }
             title = document.select("#titreOeuvre").text()
             thumbnail_url = document.selectFirst("#coverOeuvre")?.absUrl("src")
             setUrlWithoutDomain(document.baseUri())
@@ -170,7 +170,7 @@ class AnimeSama : HttpSource() {
     override fun mangaDetailsParse(response: Response): SManga = SManga.create().apply {
         val document = response.asJsoup()
         description = document.select("#sousBlocMiddle > div h2:contains(Synopsis)+p").text()
-        genre = document.select("#sousBlocMiddle > div h2:contains(Genres)+a").text()
+        genre = document.select(".genre-pill").joinToString { it.text() }
         title = document.select("#titreOeuvre").text()
         thumbnail_url = document.selectFirst("#coverOeuvre")?.absUrl("src")
     }
