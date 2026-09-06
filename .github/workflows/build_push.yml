@@ -106,7 +106,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: "individual-apks-${{ matrix.chunk.number }}"
-          path: "**/*.apk"
+          path: |
+            **/*.apk
+            **/build/keiyoushi-source-info.json
           retention-days: 1
 
       - name: Clean up CI files
@@ -152,14 +154,7 @@ jobs:
         run: |
           python ./.github/scripts/move-built-apks.py
           
-          # Use Keiyoushi inspector
-          INSPECTOR_LINK="$(curl -s "https://api.github.com/repos/keiyoushi/extensions-inspector/releases/latest" | jq -r '.assets[0].browser_download_url')"
-          curl -L "$INSPECTOR_LINK" -o ./Inspector.jar
-          
-          # move-built-apks.py script creates a 'repo' folder
-          java -jar ./Inspector.jar "repo/apk" "output.json" "tmp"
-          
-          # Create index
+          # Create index directly from built APKs and keiyoushi metadata
           python ./.github/scripts/create-repo.py
           
           # Copy repository icon
