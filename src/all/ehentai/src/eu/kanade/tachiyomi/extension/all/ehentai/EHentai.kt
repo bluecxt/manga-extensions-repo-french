@@ -22,6 +22,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.UpdateStrategy
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.annotation.Source
 import keiyoushi.utils.getPreferencesLazy
 import okhttp3.CacheControl
 import okhttp3.CookieJar
@@ -33,13 +34,31 @@ import org.jsoup.nodes.Element
 import rx.Observable
 import java.net.URLEncoder
 
-abstract class EHentai(
-    override val lang: String,
-    private val ehLang: String,
-) : HttpSource(),
+@Source
+abstract class EHentai :
+    HttpSource(),
     ConfigurableSource {
 
-    override val name = "E-Hentai"
+    private val ehLang: String = when (lang) {
+        "ja" -> "japanese"
+        "en" -> "english"
+        "zh" -> "chinese"
+        "nl" -> "dutch"
+        "fr" -> "french"
+        "de" -> "german"
+        "hu" -> "hungarian"
+        "it" -> "italian"
+        "ko" -> "korean"
+        "pl" -> "polish"
+        "pt-BR" -> "portuguese"
+        "ru" -> "russian"
+        "es" -> "spanish"
+        "th" -> "thai"
+        "vi" -> "vietnamese"
+        "none" -> "n/a"
+        "other" -> "other"
+        else -> ""
+    }
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
@@ -162,7 +181,6 @@ abstract class EHentai(
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val enforceLanguageFilter = filters.find { it is EnforceLanguageFilter }?.state == true
-        val uri = Uri.parse("$baseUrl$QUERY_PREFIX").buildUpon()
         var modifiedQuery = when {
             !isLangNatural() -> query
             query.isBlank() -> languageTag(enforceLanguageFilter)
@@ -171,24 +189,23 @@ abstract class EHentai(
         filters.filterIsInstance<TextFilter>().forEach { filter ->
             if (filter.state.isNotEmpty()) {
                 val splitted = filter.state.split(",").filter(String::isNotBlank)
-                if (splitted.size < 2 && filter.type != "tags") {
-                    modifiedQuery += " ${filter.type}:\"${filter.state.replace(" ", "+")}\""
-                } else {
-                    splitted.forEach { tag ->
-                        val trimmed = tag.trim().lowercase()
-                        modifiedQuery += if (trimmed.startsWith('-')) {
-                            " -${filter.type}:\"${trimmed.removePrefix("-").replace(" ", "+")}\""
-                        } else {
-                            " ${filter.type}:\"${trimmed.replace(" ", "+")}\""
-                        }
+                splitted.forEach { tag ->
+                    val trimmed = tag.trim().lowercase()
+                    val tagName = trimmed.removePrefix("-")
+                    val isExclude = trimmed.startsWith('-')
+                    modifiedQuery += if (isExclude) {
+                        " -${filter.type}:\"$tagName\""
+                    } else {
+                        " ${filter.type}:\"$tagName\""
                     }
                 }
             }
         }
-        uri.appendQueryParameter("f_search", modifiedQuery)
+        val baseSearchUrl = "$baseUrl$QUERY_PREFIX&f_search=${URLEncoder.encode(modifiedQuery, "UTF-8")}"
+        val uri = Uri.parse(baseSearchUrl).buildUpon()
         // when attempting to search with no genres selected, will auto select all genres
         filters.filterIsInstance<GenreGroup>().firstOrNull()?.state?.let {
-            // variable to to check is any genres are selected
+            // variable to check if any genres are selected
             val check = it.any { option -> option.state } // or it.any(GenreOption::state)
             // if no genres are selected by the user set all genres to on
             if (!check) {
@@ -256,7 +273,7 @@ abstract class EHentai(
             thumbnailUrl = select("#gd1 div").attr("style").nullIfBlank()?.let {
                 it.substring(it.indexOf('(') + 1 until it.lastIndexOf(')'))
             }
-            genre = select("#gdc div").text().nullIfBlank()?.trim()?.lowercase()
+            category = select("#gdc div").text().nullIfBlank()?.trim()?.lowercase()
 
             uploader = select("#gdn").text().nullIfBlank()?.trim()
 
@@ -436,7 +453,7 @@ abstract class EHentai(
         .appendQueryParameter(param, value)
         .toString()
 
-    override val client = network.cloudflareClient.newBuilder()
+    override val client = network.client.newBuilder()
         .cookieJar(CookieJar.NO_COOKIES)
         .addInterceptor { chain ->
             val request = chain.request()

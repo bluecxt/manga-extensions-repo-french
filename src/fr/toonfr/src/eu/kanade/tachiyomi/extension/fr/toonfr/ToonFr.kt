@@ -1,18 +1,14 @@
 package eu.kanade.tachiyomi.extension.fr.toonfr
 
 import eu.kanade.tachiyomi.multisrc.madara.Madara
-import java.text.SimpleDateFormat
+import keiyoushi.annotation.Source
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-class ToonFr :
-    Madara(
-        "Toon FR",
-        "https://toonfr.com",
-        "fr",
-        dateFormat = SimpleDateFormat("MMM d", Locale("fr")),
-    ) {
-    override val useLoadMoreRequest = LoadMoreStrategy.Never
-    override val useNewChapterEndpoint = true
+@Source
+abstract class ToonFr : Madara() {
+    override val chapterDateFormat = DateTimeFormatter.ofPattern("MMM d", Locale("fr"))
+    override val chapterMode = ChapterMode.MangaAjax
 
     override val mangaSubString = "webtoon"
 

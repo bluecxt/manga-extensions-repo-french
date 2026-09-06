@@ -7,6 +7,7 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
+import keiyoushi.annotation.Source
 import keiyoushi.utils.parseAs
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -15,13 +16,8 @@ import okhttp3.Request
 import okhttp3.Response
 import java.util.Locale
 
-class MangaMoins : HttpSource() {
-
-    override val name = "MangaMoins"
-
-    override val baseUrl = "https://mangamoins.com"
-
-    override val lang = "fr"
+@Source
+abstract class MangaMoins : HttpSource() {
 
     override val supportsLatest = true
 
@@ -205,7 +201,7 @@ class MangaMoins : HttpSource() {
         val data = response.parseAs<ScanResponse>()
         val salts = getSalts(data.pagesBaseUrl)
 
-        val baseUrl = salts.fold(data.pagesBaseUrl.removeSuffix("/")) { url, salt ->
+        val baseUrl = salts.fold(data.pagesBaseUrl.removeSuffix("/").removeSuffix("_b")) { url, salt ->
             url.replace(salt, "")
         }
 

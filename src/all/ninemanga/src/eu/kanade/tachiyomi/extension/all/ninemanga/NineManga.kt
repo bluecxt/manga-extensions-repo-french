@@ -8,10 +8,13 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.annotation.Source
 import keiyoushi.lib.cookieinterceptor.CookieInterceptor
+import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -23,32 +26,35 @@ import java.util.Locale
 
 private val dateFormat = SimpleDateFormat("MMM d, yyyy", Locale.ENGLISH)
 
-open class NineManga(
-    override val name: String,
-    override val baseUrl: String,
-    override val lang: String,
-) : HttpSource() {
+@Source
+abstract class NineManga : HttpSource() {
 
     override val supportsLatest: Boolean = true
 
-    private val cookieInterceptor = CookieInterceptor(baseUrl.substringAfter("://"), "ninemanga_list_num" to "1")
+    private val cookieInterceptor by lazy {
+        CookieInterceptor(baseUrl.substringAfter("://"), "ninemanga_list_num" to "1")
+    }
 
     private val imgNiaddRegex = """img\d.\.niadd.com""".toRegex()
+    private val imgRegex = Regex("""all_imgs_url\s*:\s*\[\s*([^]]*)\s*,\s*]""")
+    private val redirectRegex = Regex("""window\.location\.href\s*=\s*["'](.*?)["']""")
 
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .addInterceptor { chain ->
-            val request = chain.request()
-            val url = request.url.toString()
-            if (url.contains(imgNiaddRegex)) {
-                val newRequest = request.newBuilder()
-                    .addHeader("Referer", "$baseUrl/")
-                    .build()
-                return@addInterceptor chain.proceed(newRequest)
+    override val client: OkHttpClient by lazy {
+        network.client.newBuilder()
+            .addInterceptor { chain ->
+                val request = chain.request()
+                val url = request.url.toString()
+                if (url.contains(imgNiaddRegex)) {
+                    val newRequest = request.newBuilder()
+                        .addHeader("Referer", "$baseUrl/")
+                        .build()
+                    return@addInterceptor chain.proceed(newRequest)
+                }
+                chain.proceed(request)
             }
-            chain.proceed(request)
-        }
-        .addNetworkInterceptor(cookieInterceptor)
-        .build()
+            .addNetworkInterceptor(cookieInterceptor)
+            .build()
+    }
 
     override fun headersBuilder(): Headers.Builder = Headers.Builder()
         .add("Accept-Language", "es-ES,es;q=0.9,en;q=0.8,gl;q=0.7")
@@ -65,7 +71,11 @@ open class NineManga(
 
     protected open fun latestUpdatesFromElement(element: Element) = SManga.create().apply {
         element.selectFirst("a.bookname")?.let {
-            url = it.attr("abs:href").substringAfter(baseUrl)
+            url = if (lang == "en") {
+                it.attr("abs:href").substringAfter("ninemanga.com")
+            } else {
+                it.attr("abs:href").substringAfter(baseUrl)
+            }
             title = it.text()
         }
         thumbnail_url = element.selectFirst("img")?.attr("abs:src")
@@ -83,9 +93,10 @@ open class NineManga(
     protected open fun popularMangaFromElement(element: Element) = latestUpdatesFromElement(element)
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val q = if (lang in listOf("es", "ru", "fr")) query.substringBefore("'") else query
         val url = "$baseUrl/search/".toHttpUrl().newBuilder()
 
-        url.addQueryParameter("wd", query)
+        url.addQueryParameter("wd", q)
         url.addQueryParameter("page", page.toString())
 
         filters.forEach { filter ->
@@ -134,10 +145,41 @@ open class NineManga(
         }
     }
 
-    open fun parseStatus(status: String) = when {
-        status.contains("Ongoing") -> SManga.ONGOING
-        status.contains("Completed") -> SManga.COMPLETED
-        else -> SManga.UNKNOWN
+    open fun parseStatus(status: String) = when (lang) {
+        "es" -> when {
+            status.contains("En curso") -> SManga.ONGOING
+            status.contains("Completado") -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
+        "pt-BR" -> when {
+            status.contains("Em tradução") -> SManga.ONGOING
+            status.contains("Completo") -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
+        "ru" -> when {
+            status.contains("завершенный") -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
+        "de" -> when {
+            status.contains("Laufende") -> SManga.ONGOING
+            status.contains("Abgeschlossen") -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
+        "it" -> when {
+            status.contains("In corso") -> SManga.ONGOING
+            status.contains("Completato") -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
+        "fr" -> when {
+            status.contains("En cours") -> SManga.ONGOING
+            status.contains("Complété") -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
+        else -> when {
+            status.contains("Ongoing") -> SManga.ONGOING
+            status.contains("Completed") -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
     }
 
     override fun chapterListRequest(manga: SManga): Request {
@@ -169,8 +211,8 @@ open class NineManga(
             } else {
                 val timeAgo = dateWords[0].toIntOrNull() ?: return 0L
                 val calField = when (dateWords[1]) {
-                    "minutes" -> Calendar.MINUTE
-                    "hours" -> Calendar.HOUR
+                    "minutos", "минут", "minuti", "minutes" -> Calendar.MINUTE
+                    "horas", "hora", "часа", "Stunden", "ore", "heures" -> Calendar.HOUR
                     else -> return 0L
                 }
                 return Calendar.getInstance().apply {
@@ -181,9 +223,66 @@ open class NineManga(
         return 0L
     }
 
+    override fun pageListRequest(chapter: SChapter): Request {
+        if (lang == "es") {
+            val headers = headers.newBuilder()
+                .set("Referer", "$baseUrl/")
+                .build()
+            return GET(baseUrl + chapter.url, headers)
+        }
+        return super.pageListRequest(chapter)
+    }
+
     override fun pageListParse(response: Response): List<Page> = pageListParse(response.asJsoup())
 
-    open fun pageListParse(document: Document): List<Page> = document.select("select#page").first()?.select("option")?.mapIndexed { index, element ->
+    open fun pageListParse(document: Document): List<Page> {
+        if (lang == "es") {
+            val serverUrl = document.selectFirst("section.section div.post-content-body > a")?.absUrl("href")
+            if (serverUrl != null) {
+                val serverHeaders = headers.newBuilder()
+                    .set("Referer", document.baseUri())
+                    .build()
+                return pageListParse(client.newCall(GET(serverUrl, serverHeaders)).execute().asJsoup())
+            }
+
+            val redirectScript = document.selectFirst("body > script:containsData(window.location.href)")?.data()
+            if (redirectScript != null) {
+                val documentLocation = document.location()
+                val redirectUrl = redirectRegex.find(redirectScript)
+                    ?.groupValues?.get(1)
+                    ?.let { path ->
+                        path.toHttpUrlOrNull()
+                            ?: documentLocation.toHttpUrl().newBuilder()
+                                .encodedPath(path)
+                                .build()
+                    } ?: return defaultPageListParse(document)
+
+                val headers = headers.newBuilder()
+                    .set("Referer", documentLocation)
+                    .build()
+
+                val redirectedDocument = client.newCall(
+                    GET(redirectUrl, headers),
+                ).execute().asJsoup()
+
+                return pageListParse(redirectedDocument)
+            }
+
+            val script = document.selectFirst("script:containsData(all_imgs_url)")?.data()
+                ?: return defaultPageListParse(document)
+
+            val images = imgRegex.find(script)?.groupValues?.get(1)
+                ?.let { "[$it]".parseAs<List<String>>() }
+                ?: throw Exception("Image list not found")
+
+            return images.mapIndexed { idx, img ->
+                Page(idx, imageUrl = img)
+            }
+        }
+        return defaultPageListParse(document)
+    }
+
+    private fun defaultPageListParse(document: Document): List<Page> = document.select("select#page").first()?.select("option")?.mapIndexed { index, element ->
         Page(index, url = baseUrl + element.attr("value"))
     } ?: emptyList()
 
@@ -201,5 +300,13 @@ open class NineManga(
         CompletedFilter(),
     )
 
-    open fun getGenreList(): List<Genre> = enGenres
+    open fun getGenreList(): List<Genre> = when (lang) {
+        "es" -> esGenres
+        "pt-BR" -> brGenres
+        "ru" -> ruGenres
+        "de" -> deGenres
+        "it" -> itGenres
+        "fr" -> frGenres
+        else -> enGenres
+    }
 }
