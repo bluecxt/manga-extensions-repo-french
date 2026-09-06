@@ -79,6 +79,8 @@ class ExtensionPlugin : Plugin<Project> {
                     storePassword = providers.environmentVariable("KEY_STORE_PASSWORD").orNull
                     keyAlias = providers.environmentVariable("ALIAS").orNull
                     keyPassword = providers.environmentVariable("KEY_PASSWORD").orNull
+                    enableV1Signing = true
+                    enableV2Signing = true
                 }
             }
 

@@ -53,3 +53,11 @@
 
 # dont obfuscate chromium boundry interfaces, needed for reflections; used by runWebView
 -keepnames interface org.chromium.support_lib_boundary.** { *; }
+
+# Extension entry point and sources (needed for R8 so classes.dex is not stripped in APKs)
+-keep class keiyoushi.source.Generated { *; }
+-keep class eu.kanade.tachiyomi.extension.** { *; }
+-keep class * implements eu.kanade.tachiyomi.source.Source { *; }
+-keep class * extends eu.kanade.tachiyomi.source.online.HttpSource { *; }
+-keep class * extends eu.kanade.tachiyomi.source.CatalogueSource { *; }
+

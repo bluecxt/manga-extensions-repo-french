@@ -107,7 +107,7 @@ jobs:
         with:
           name: "individual-apks-${{ matrix.chunk.number }}"
           path: |
-            **/*.apk
+            **/build/outputs/apk/release/*.apk
             **/build/keiyoushi-source-info.json
           retention-days: 1
 
@@ -164,11 +164,16 @@ jobs:
           SAMPLE_APK=$(find repo/apk -name "*.apk" | head -n 1)
           if [ -n "$SAMPLE_APK" ]; then
             FINGERPRINT=$(keytool -printcert -jarfile "$SAMPLE_APK" | grep "SHA256:" | head -n 1 | awk -F': ' '{print $2}' | sed 's/://g' | tr '[:upper:]' '[:lower:]')
+            if [ -z "$FINGERPRINT" ]; then
+              echo "ERROR: Failed to extract signing key fingerprint from $SAMPLE_APK!"
+              exit 1
+            fi
             REPO_ICON_URL="https://raw.githubusercontent.com/${{ github.repository }}/repo/icon.png"
             echo "{\"meta\":{\"name\":\"bluecxt French Extensions\",\"shortName\":\"BCXT-FR\",\"website\":\"https://github.com/${{ github.repository }}\",\"signingKeyFingerprint\":\"$FINGERPRINT\",\"iconUrl\":\"$REPO_ICON_URL\"}}" > repo/repo.json
-            echo "Successfully generated repo.json with icon"
+            echo "Successfully generated repo.json with fingerprint: $FINGERPRINT"
           else
-            echo "Warning: No APK found to extract fingerprint!"
+            echo "ERROR: No APK found to extract fingerprint!"
+            exit 1
           fi
 
       - name: Deploy to repo branch
