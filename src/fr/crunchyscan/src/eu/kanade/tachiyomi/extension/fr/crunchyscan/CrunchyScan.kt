@@ -9,8 +9,9 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.ParsedHttpSource
+import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.annotation.Source
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -32,14 +33,12 @@ import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
 import java.util.Locale
 
-class CrunchyScan : ParsedHttpSource() {
+@Source
+abstract class CrunchyScan : HttpSource() {
 
-    override val name = "CrunchyScan"
-    override val baseUrl = "https://cdn.crunchyscan.fr"
-    override val lang = "fr"
     override val supportsLatest = true
 
-    override val client = network.cloudflareClient
+    override val client = network.client
 
     private val json = Json {
         ignoreUnknownKeys = true
@@ -107,19 +106,6 @@ class CrunchyScan : ParsedHttpSource() {
 
     override fun popularMangaParse(response: Response): MangasPage = searchMangaParse(response)
 
-    override fun popularMangaSelector() = throw UnsupportedOperationException()
-
-    override fun popularMangaFromElement(element: Element): SManga = SManga.create().apply {
-        val anchor = element.selectFirst("a.font-bold, a.chapter-link")
-        setUrlWithoutDomain(anchor?.attr("href") ?: "")
-        title = anchor?.text()?.trim() ?: ""
-        thumbnail_url = element.selectFirst("img")?.let {
-            it.absUrl("data-src").ifEmpty { it.absUrl("src") }
-        }
-    }
-
-    override fun popularMangaNextPageSelector() = null
-
     // =============================== Latest ===============================
     override fun latestUpdatesRequest(page: Int): Request {
         val token = fetchToken()
@@ -142,12 +128,6 @@ class CrunchyScan : ParsedHttpSource() {
     }
 
     override fun latestUpdatesParse(response: Response): MangasPage = searchMangaParse(response)
-
-    override fun latestUpdatesSelector() = throw UnsupportedOperationException()
-
-    override fun latestUpdatesFromElement(element: Element): SManga = popularMangaFromElement(element)
-
-    override fun latestUpdatesNextPageSelector(): String? = null
 
     // =============================== Search ===============================
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
@@ -244,67 +224,62 @@ class CrunchyScan : ParsedHttpSource() {
         }
     }
 
-    override fun searchMangaSelector() = throw UnsupportedOperationException()
-    override fun searchMangaFromElement(element: Element) = throw UnsupportedOperationException()
-    override fun searchMangaNextPageSelector(): String? = null
-
     // =========================== Manga Details ============================
-    override fun mangaDetailsParse(document: Document): SManga = SManga.create().apply {
-        val jsonLd = document.selectFirst("script[type=application/ld+json]")?.data()
-        if (jsonLd != null) {
-            try {
-                val content = json.parseToJsonElement(jsonLd).jsonObject
-                title = content["name"]?.jsonPrimitive?.content ?: ""
-                description = content["description"]?.jsonPrimitive?.content ?: ""
-                thumbnail_url = content["image"]?.jsonPrimitive?.content ?: ""
-                genre = content["genre"]?.jsonPrimitive?.content ?: ""
+    override fun mangaDetailsParse(response: Response): SManga {
+        val document = response.asJsoup()
+        return SManga.create().apply {
+            val jsonLd = document.selectFirst("script[type=application/ld+json]")?.data()
+            if (jsonLd != null) {
+                try {
+                    val content = json.parseToJsonElement(jsonLd).jsonObject
+                    title = content["name"]?.jsonPrimitive?.content ?: ""
+                    description = content["description"]?.jsonPrimitive?.content ?: ""
+                    thumbnail_url = content["image"]?.jsonPrimitive?.content ?: ""
+                    genre = content["genre"]?.jsonPrimitive?.content ?: ""
 
-                val authorList = content["author"]?.jsonArray
-                author = authorList?.joinToString { it.jsonObject["name"]?.jsonPrimitive?.content ?: "" }
+                    val authorList = content["author"]?.jsonArray
+                    author = authorList?.joinToString { it.jsonObject["name"]?.jsonPrimitive?.content ?: "" }
 
-                val artistList = content["illustrator"]?.jsonArray ?: content["editor"]?.jsonArray
-                artist = artistList?.joinToString { it.jsonObject["name"]?.jsonPrimitive?.content ?: "" }
-            } catch (e: Exception) {
-                Log.e("CrunchyScan", "Error parsing JSON-LD", e)
+                    val artistList = content["illustrator"]?.jsonArray ?: content["editor"]?.jsonArray
+                    artist = artistList?.joinToString { it.jsonObject["name"]?.jsonPrimitive?.content ?: "" }
+                } catch (e: Exception) {
+                    Log.e("CrunchyScan", "Error parsing JSON-LD", e)
+                }
             }
-        }
 
-        // Fallback to Jsoup or supplement data (like status which is not in JSON-LD)
-        if (title.isNullOrBlank()) {
-            title = document.selectFirst("h1")?.text() ?: ""
-        }
-        if (description.isNullOrBlank()) {
-            description = document.select("div.mt-12.max-h-48 p, div.flex.flex-col.gap-2.mt-5 > p, div#description, p#synopsis").joinToString("\n") { it.text() }.trim()
-        }
-        if (thumbnail_url.isNullOrBlank()) {
-            thumbnail_url = document.selectFirst("img.manga_cover, img.manga-cover, img.rounded.object-cover")?.let {
-                it.absUrl("data-src").ifEmpty { it.absUrl("src") }
+            // Fallback to Jsoup or supplement data (like status which is not in JSON-LD)
+            if (title.isNullOrBlank()) {
+                title = document.selectFirst("h1")?.text() ?: ""
             }
-        }
-        if (genre.isNullOrBlank()) {
-            genre = document.select("h3[aria-label*='genre' i] + div a, div.flex.flex-wrap.gap-2 > a[href*='genre']").joinToString { it.text() }
-        }
+            if (description.isNullOrBlank()) {
+                description = document.select("div.mt-12.max-h-48 p, div.flex.flex-col.gap-2.mt-5 > p, div#description, p#synopsis").joinToString("\n") { it.text() }.trim()
+            }
+            if (thumbnail_url.isNullOrBlank()) {
+                thumbnail_url = document.selectFirst("img.manga_cover, img.manga-cover, img.rounded.object-cover")?.let {
+                    it.absUrl("data-src").ifEmpty { it.absUrl("src") }
+                }
+            }
+            if (genre.isNullOrBlank()) {
+                genre = document.select("h3[aria-label*='genre' i] + div a, div.flex.flex-wrap.gap-2 > a[href*='genre']").joinToString { it.text() }
+            }
 
-        val statusText = document.selectFirst("div:has(> h3:contains(Status)) > p, h3:contains(Status) + p")?.text()?.trim()
-        status = when {
-            statusText?.equals("En cours", ignoreCase = true) == true -> SManga.ONGOING
-            statusText?.equals("Terminé", ignoreCase = true) == true -> SManga.COMPLETED
-            statusText?.equals("En pause", ignoreCase = true) == true -> SManga.ON_HIATUS
-            statusText?.equals("Abandonné", ignoreCase = true) == true -> SManga.CANCELLED
-            else -> SManga.UNKNOWN
-        }
+            val statusText = document.selectFirst("div:has(> h3:contains(Status)) > p, h3:contains(Status) + p")?.text()?.trim()
+            status = when {
+                statusText?.equals("En cours", ignoreCase = true) == true -> SManga.ONGOING
+                statusText?.equals("Terminé", ignoreCase = true) == true -> SManga.COMPLETED
+                statusText?.equals("En pause", ignoreCase = true) == true -> SManga.ON_HIATUS
+                statusText?.equals("Abandonné", ignoreCase = true) == true -> SManga.CANCELLED
+                else -> SManga.UNKNOWN
+            }
 
-        if (author.isNullOrBlank()) {
-            author = document.select("h3[aria-label*='auteur' i] + div a, p:contains(Auteur) + p, span:contains(Auteur) + span").joinToString { it.text() }.ifEmpty { null }
-        }
-        if (artist.isNullOrBlank()) {
-            artist = document.select("h3[aria-label*='artiste' i] + div a, p:contains(Artiste) + p, span:contains(Artiste) + span").joinToString { it.text() }.ifEmpty { null }
+            if (author.isNullOrBlank()) {
+                author = document.select("h3[aria-label*='auteur' i] + div a, p:contains(Auteur) + p, span:contains(Auteur) + span").joinToString { it.text() }.ifEmpty { null }
+            }
+            if (artist.isNullOrBlank()) {
+                artist = document.select("h3[aria-label*='artiste' i] + div a, p:contains(Artiste) + p, span:contains(Artiste) + span").joinToString { it.text() }.ifEmpty { null }
+            }
         }
     }
-
-    override fun relatedMangaListParse(response: Response): List<SManga> = emptyList()
-    override fun relatedMangaListSelector(): String = throw UnsupportedOperationException()
-    override fun relatedMangaFromElement(element: Element): SManga = throw UnsupportedOperationException()
 
     // ============================== Chapters ==============================
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -341,7 +316,7 @@ class CrunchyScan : ParsedHttpSource() {
             }
         }
 
-        val chapters = document.select(chapterListSelector())
+        val chapters = document.select("div#ChapterWrap a.chapter-link, div#ChapterWrap a.flex.bg-secondary")
         if (chapters.isEmpty()) {
             return emptyList()
         }
@@ -349,15 +324,14 @@ class CrunchyScan : ParsedHttpSource() {
         return chapters.map { chapterFromElement(it) }
     }
 
-    override fun chapterListSelector() = "div#ChapterWrap a.chapter-link, div#ChapterWrap a.flex.bg-secondary"
-
-    override fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
+    private fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
         setUrlWithoutDomain(element.attr("href"))
         name = element.text().trim().replace("\n", " ").replace(Regex("\\s+"), " ")
     }
 
     // =============================== Pages ================================
-    override fun pageListParse(document: Document): List<Page> {
+    override fun pageListParse(response: Response): List<Page> {
+        val document = response.asJsoup()
         val encryptedData = document.selectFirst("div#readerList, div.reader-images")?.attr("data-meta")
         if (encryptedData != null) {
             return try {
@@ -380,7 +354,7 @@ class CrunchyScan : ParsedHttpSource() {
         return pages
     }
 
-    override fun imageUrlParse(document: Document) = throw UnsupportedOperationException()
+    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     private fun decryptPages(hexData: String, document: Document): List<Page> {
         // TODO: Implement WASM-derived AES decryption

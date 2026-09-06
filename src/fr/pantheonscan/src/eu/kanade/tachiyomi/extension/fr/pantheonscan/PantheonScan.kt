@@ -1,9 +1,12 @@
 package eu.kanade.tachiyomi.extension.fr.pantheonscan
 
-import eu.kanade.tachiyomi.multisrc.madara.Madara
-import java.text.SimpleDateFormat
+import eu.kanade.tachiyomi.multisrc.madara.MadaraNoAjax
+import keiyoushi.annotation.Source
+import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-class PantheonScan : Madara("Pantheon Scan", "https://pantheon-scan.com", "fr", dateFormat = SimpleDateFormat("d MMMM yyyy", Locale.FRANCE)) {
-    override val useNewChapterEndpoint = true
+@Source
+abstract class PantheonScan : MadaraNoAjax() {
+    override val chapterDateFormat = DateTimeFormatter.ofPattern("d MMMM yyyy", Locale.FRANCE)
+    override val chapterMode = ChapterMode.MangaAjax
 }

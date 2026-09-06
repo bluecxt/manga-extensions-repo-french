@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.all.hentai3
 
+import keiyoushi.utils.tryParse
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.text.SimpleDateFormat
@@ -26,7 +27,7 @@ internal object Hentai3Utils {
         }
     }
 
-    fun getTagDescription(document: Document): String {
+    fun getDescriptions(document: Document): String {
         val stringBuilder = StringBuilder()
 
         // "a[href*=/category/]"
@@ -34,8 +35,17 @@ internal object Hentai3Utils {
         if (categories.isNotEmpty()) {
             stringBuilder.append("Categories: ")
             stringBuilder.append(categories.joinToString { it.cleanTag() })
-            stringBuilder.append("\n\n")
+            stringBuilder.append("\n")
         }
+
+        // "a[href*=/group/]"
+        val groups = getGroups(document)
+        if (!groups.isNullOrBlank()) {
+            stringBuilder.append("Groups: ")
+            stringBuilder.append(groups)
+            stringBuilder.append("\n")
+        }
+        stringBuilder.append("\n")
 
         // "a[href*=/series/]"
         val series = document.select("#main-info > div.tag-container:contains(Series) > .filter-elem > a.name")
@@ -76,14 +86,9 @@ internal object Hentai3Utils {
         val timeString = document.selectFirst("#main-info > div.tag-container > time")
             ?.attr("datetime")
             ?.replace("T", " ")
-            ?: ""
 
-        return SimpleDateFormat("yyyy-MM-dd HH:mm:ssZ", Locale.getDefault()).parse(timeString)?.time ?: 0L
+        return SimpleDateFormat("yyyy-MM-dd HH:mm:ssZ", Locale.getDefault()).tryParse(timeString)
     }
-
-//    val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssZZZZZ", Locale.ENGLISH).apply {
-//        timeZone = TimeZone.getTimeZone("UTC")
-//    }
 
     fun getCodes(document: Document): String? {
         val codes = document.select("#main-info > h3 > strong")
@@ -102,9 +107,11 @@ internal object Hentai3Utils {
 
     private fun Element.cleanTag(): String = text()
         .replace("(female)", "♀").replace("(male)", "♂")
-        .replace(Regex("\\(.*\\)"), "")
+        .replace(bracketRegex, "")
         .capitalizeEach()
         .trim()
+
+    private val bracketRegex by lazy { Regex("""\(.*\)""") }
 
     private fun String.capitalizeEach() = this.split(" ").joinToString(" ") { s ->
         s.replaceFirstChar { sr ->
