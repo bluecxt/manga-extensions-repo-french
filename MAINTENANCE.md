@@ -55,7 +55,6 @@ git checkout yuzono/master -- src/fr/nouvelle_extension
 | **ehentai** | `cursed` | `src/all/ehentai` |
 | **hitomi** | `cursed` | `src/all/hitomi` |
 | **pururin** | `cursed` | `src/all/pururin` |
-|**crunchyscan**|`standalone`|`src/all/crunchyscan`|
 
 ---
 
