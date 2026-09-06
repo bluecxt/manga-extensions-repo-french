@@ -45,10 +45,19 @@ jobs:
           $(git log -1 --pretty=%B)
           {delimiter}" >> $GITHUB_OUTPUT
 
+      - name: Get last successful CI commit
+        if: github.event_name != 'workflow_dispatch'
+        uses: nrwl/nx-set-shas@v4
+        with:
+          main-branch-name: ${{ github.ref_name }}
+          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+
       - id: generate-matrices
         name: Create output matrices
+        env:
+          BASE_SHA: ${{ github.event_name == 'workflow_dispatch' && 'all' || env.NX_BASE }}
         run: |
-          python ./.github/scripts/generate-build-matrices.py "all" Release
+          python ./.github/scripts/generate-build-matrices.py "${BASE_SHA:-all}" Release
 
   build:
     name: Build extensions (${{ matrix.chunk.number }})
@@ -64,6 +73,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
+      - name: Force unique cache key based on task
+        run: echo "build.task=assembleRelease" >> gradle.properties
+
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
@@ -72,8 +84,9 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
-        with:
-          cache-read-only: ${{ matrix.chunk.number > 1 }}
+
+      - name: Clean up runner gradle.properties
+        run: rm -f ~/.gradle/gradle.properties
 
       - name: Prepare signing key
         if: ${{ env.SIGNING_KEY != '' }}
@@ -119,6 +132,21 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v6
+
+      - name: Checkout repo branch
+        uses: actions/checkout@v6
+        continue-on-error: true
+        with:
+          ref: repo
+          path: temp_repo
+
+      - name: Copy existing repo
+        run: |
+          if [ -d "temp_repo" ]; then
+            mkdir -p repo
+            cp -rn temp_repo/* repo/ 2>/dev/null || cp -r temp_repo/* repo/ || true
+          fi
+          rm -rf temp_repo
 
       - name: Create repo artifacts
         run: |

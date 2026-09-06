@@ -124,10 +124,15 @@ def resolve_ext(multisrcs: set[str], libs: set[str]) -> set[tuple[str, str]]:
     return extensions
 
 def get_module_list(ref: str) -> tuple[list[str], list[str]]:
-    if ref == "all":
+    if not ref or ref == "all":
         return get_all_modules()
 
-    diff_output = run_command(f"git diff --name-status {ref}").splitlines()
+    result = subprocess.run(f"git diff --name-status {ref}", capture_output=True, text=True, shell=True)
+    if result.returncode != 0:
+        print(f"Warning: git diff with ref '{ref}' failed (exit code {result.returncode}), falling back to building all modules.")
+        return get_all_modules()
+
+    diff_output = result.stdout.strip().splitlines()
 
     changed_files = [
         file
