@@ -47,7 +47,7 @@ jobs:
 
       - name: Get last successful CI commit
         if: github.event_name != 'workflow_dispatch'
-        uses: nrwl/nx-set-shas@v4
+        uses: nrwl/nx-set-shas@v5
         with:
           main-branch-name: ${{ github.ref_name }}
           fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904
