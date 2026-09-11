@@ -7,8 +7,12 @@ import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
-import android.view.View
+import android.util.Base64
+import android.util.Log
+import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.preference.ListPreference
@@ -29,24 +33,31 @@ import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.string
+import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import okhttp3.FormBody
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.nodes.Element
 import rx.Observable
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
+import java.io.File
+import java.io.IOException
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlin.collections.mapIndexed
 import kotlin.time.Duration.Companion.seconds
 
 @Source
@@ -54,8 +65,6 @@ abstract class Japscan :
     HttpSource(),
     ConfigurableSource {
 
-    // Sometimes an adblock blocker will pop up, preventing the user from opening
-    // a cloudflare protected page
     private val internalBaseUrl = "https://www.japscan.foo"
 
     override val supportsLatest = true
@@ -63,12 +72,39 @@ abstract class Japscan :
     private val preferences: SharedPreferences by getPreferencesLazy()
 
     override val client: OkHttpClient = network.client.newBuilder()
+        .addInterceptor { chain ->
+            val req = chain.request()
+            if (req.url.host == JAPSCAN_CACHE_HOST) {
+                val path = "/" + req.url.pathSegments.joinToString("/")
+                val bytes = runCatching { File(path).readBytes() }.getOrNull()
+                return@addInterceptor Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(if (bytes != null) 200 else 404)
+                    .message(if (bytes != null) "OK" else "Not Found")
+                    .body((bytes ?: ByteArray(0)).toResponseBody("image/jpeg".toMediaType()))
+                    .build()
+            }
+            val response = chain.proceed(req)
+            if (response.code in listOf(403, 503)) {
+                val isCf = response.header("Server")?.contains("cloudflare", ignoreCase = true) == true ||
+                    response.header("cf-ray") != null ||
+                    response.peekBody(1024).string().contains("Just a moment", ignoreCase = true)
+                if (isCf) {
+                    throw IOException("Cloudflare challenge détecté (HTTP ${response.code}). Ouvrez dans la WebView pour résoudre.")
+                }
+            }
+            response
+        }
         .rateLimit(1, 2.seconds)
         .build()
 
     private val captchaRegex = """window\.__captcha\s*=\s*\{\s*needed\s*:\s*true\s*,?""".toRegex()
 
     companion object {
+        private const val JAPSCAN_CACHE_HOST = "japscan-cache.local"
+        private const val CACHE_FILE_PREFIX = "japscan-"
+
         private val CHAPTER_PATH_TYPES = setOf("manga", "manhua", "manhwa", "bd", "comic")
         private val HIDDEN_STYLE_TOKENS = listOf(
             "display:none",
@@ -385,11 +421,90 @@ abstract class Japscan :
 
         val handler = Handler(Looper.getMainLooper())
         val latch = CountDownLatch(1)
-        val jsInterface = JsInterface(latch)
+        sweepPageCache(context.cacheDir)
         var webView: WebView? = null
         var request: Response = client.newCall(GET("$internalBaseUrl${chapter.url}", headers)).execute()
         var pageContent = request.body.string()
+
+        Log.d("JapscanDebug", "fetchPageList for ${chapter.url} - page length: ${pageContent.length}")
+
+        // Attempt automatic challenge solving
+        val stripsArrayRegex = """(?:strips|"[a-f0-9]{6}")\s*:\s*(\[[^\]]*\])""".toRegex()
+        val elementRegex = """\{\s*"uuid"\s*:\s*"([^"]+)"\s*,\s*"src"\s*:\s*"([^"]*)"\s*\}""".toRegex()
+        val tokenRegex = """(?:token|"[a-f0-9]{6}")\s*:\s*"([0-9a-fA-F]{64})"""".toRegex()
+
+        var autoCaptchaTry = 0
+        while (autoCaptchaTry < 3) {
+            val stripsMatch = stripsArrayRegex.find(pageContent)
+            val stripsContent = stripsMatch?.groupValues?.get(1).orEmpty()
+            val tokenMatch = tokenRegex.find(pageContent)
+
+            if (stripsContent.isNotEmpty() && tokenMatch != null) {
+                Log.d("JapscanDebug", "Captcha detected on try #$autoCaptchaTry - token found")
+                val items = elementRegex.findAll(stripsContent).map {
+                    val uuid = it.groupValues[1]
+                    val src = it.groupValues[2]
+                    uuid to src
+                }.toList()
+
+                if (items.size == 4) {
+                    val solved = runCatching {
+                        val answer = orderUuidsByImageVerticality(items)
+                        Log.d("JapscanDebug", "Captcha ordered UUIDs: $answer")
+                        val token = tokenMatch.groupValues[1]
+                        val multipartBody = MultipartBody.Builder()
+                            .setType(MultipartBody.FORM)
+                            .addFormDataPart("token", token)
+                            .addFormDataPart("answer", answer.toJsonString())
+                            .build()
+
+                        val captchaRequest = client.newCall(
+                            POST(
+                                "$internalBaseUrl/validate-captcha/",
+                                headers = headers.newBuilder()
+                                    .add("Referer", "$internalBaseUrl${chapter.url}")
+                                    .build(),
+                                body = multipartBody,
+                            ),
+                        ).execute()
+                        val captchaResponseBody = captchaRequest.body.string()
+                        Log.d("JapscanDebug", "Captcha response: $captchaResponseBody")
+                        captchaResponseBody.contains(""""success":\s*true""".toRegex())
+                    }.getOrDefault(false)
+
+                    if (solved) {
+                        Log.d("JapscanDebug", "Captcha solved successfully! Reloading page...")
+                        request = client.newCall(GET("$internalBaseUrl${chapter.url}", headers)).execute()
+                        pageContent = request.body.string()
+                        if (!pageContent.contains(captchaRegex)) {
+                            Log.d("JapscanDebug", "Captcha cleared after reload!")
+                            break
+                        }
+                    } else {
+                        Log.d("JapscanDebug", "Captcha solving attempt #$autoCaptchaTry failed. Re-fetching chapter to get a new captcha...")
+                        // Re-fetch chapter page so the next try operates on a brand new challenge image
+                        request = client.newCall(GET("$internalBaseUrl${chapter.url}", headers)).execute()
+                        pageContent = request.body.string()
+                    }
+                } else {
+                    Log.d("JapscanDebug", "Captcha items count is not 4: ${items.size}")
+                }
+                autoCaptchaTry++
+            } else {
+                Log.d("JapscanDebug", "No strips or token detected in page content.")
+                break
+            }
+        }
+
         val matchResult = captchaRegex.find(pageContent)
+        Log.d("JapscanDebug", "captchaRegex match: ${matchResult != null}")
+        if (matchResult != null) {
+            val idx = pageContent.indexOf("window.__captcha")
+            if (idx != -1) {
+                val snippet = pageContent.substring(idx, minOf(pageContent.length, idx + 1000))
+                Log.d("JapscanDebug", "Captcha snippet: $snippet")
+            }
+        }
 
         if (matchResult != null) {
             try {
@@ -433,204 +548,286 @@ abstract class Japscan :
             }
         }
 
-        handler.post {
-            val innerWv = WebView(context)
+        val urlSegment = chapter.url.trimStart('/').substringBefore('/').lowercase()
+        val isWebtoon = urlSegment == "manhwa" || urlSegment == "manhua"
+        val jsInterface = JsInterface(latch, context.cacheDir)
 
+        handler.post {
+            // Synchronize cookies from OkHttp client to Android WebView CookieManager
+            val cookieManager = CookieManager.getInstance()
+            cookieManager.setAcceptCookie(true)
+            val httpUrl = "$internalBaseUrl${chapter.url}".toHttpUrl()
+            val okHttpCookies = client.cookieJar.loadForRequest(httpUrl)
+            for (cookie in okHttpCookies) {
+                cookieManager.setCookie(internalBaseUrl, "${cookie.name}=${cookie.value}; path=/; domain=${httpUrl.host}")
+            }
+            cookieManager.flush()
+
+            val innerWv = WebView(context)
             webView = innerWv
+            cookieManager.setAcceptThirdPartyCookies(innerWv, true)
+
             innerWv.settings.domStorageEnabled = true
             innerWv.settings.javaScriptEnabled = true
-            innerWv.settings.blockNetworkImage = true
+            innerWv.settings.blockNetworkImage = false
             innerWv.settings.userAgentString = headers["User-Agent"]
-            innerWv.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
             innerWv.addJavascriptInterface(jsInterface, interfaceName)
+
+            innerWv.webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                    Log.d("JapscanDebug", "[Console] ${consoleMessage?.message()} -- line ${consoleMessage?.lineNumber()}")
+                    return true
+                }
+            }
 
             innerWv.webViewClient = object : WebViewClient() {
                 override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                     super.onPageStarted(view, url, favicon)
+                    Log.d("JapscanDebug", "WebView onPageStarted: $url")
+
+                    // Satisfy anti-adblock check
                     view?.evaluateJavascript(
-                        $$"""
-                            function waitForRC(callback) {
-                                if (window.__rc) {
-                                    callback();
-                                } else {
-                                    setTimeout(() => waitForRC(callback), 100);
-                                }
-                            }
-
-                            // Hook atob — Japscan delivers the chapter payload as a base64-encoded
-                            // JSON whose `cc` array contains the c4.japscan.foo image URLs. The
-                            // payload no longer goes through String.replace, so atob is the only
-                            // reliable interception point.
-                            const originalAtob = window.atob;
-                            window.atob = function(str) {
-                                const result = originalAtob.call(this, str);
-                                try {
-                                    let utf8 = result;
-                                    try {
-                                        utf8 = decodeURIComponent(
-                                            Array.from(result, c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('')
-                                        );
-                                    } catch (e) { return result; }
-                                    if (utf8.indexOf('c4.japscan.foo') !== -1 && !window.__createCalled) {
-                                        try {
-                                            const parsed = JSON.parse(utf8);
-                                            waitForRC(() => create(parsed));
-                                        } catch (e) { /* not JSON */ }
-                                    }
-                                } catch (e) { /* swallow */ }
-                                return result;
-                            };
-
-                            const originalReplace = String.prototype.replace;
-
-                            function tryDecodeBase64ToJsonKeysOnly(str) {
-                              const s = String(str).trim();
-                              if (!/^[A-Za-z0-9+/]+={0,2}$/.test(s) || s.length % 4 === 1) return null;
-                              try {
-                                const bin = atob(s);
-                                const utf8 = decodeURIComponent(
-                                  Array.from(bin, c => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join('')
-                                );
-                                if(!utf8.includes(location.pathname.replaceAll("/", "\\/"))) return null;
-                                const parsed = JSON.parse(utf8);
-                                return parsed
-                              } catch (e) {
-                                return null;
-                              }
-                              return null;
-                            }
-
-                            String.prototype.replace = function(searchValue, replaceValue) {
-                              const receiver = this;
-
-                              const effectiveReplace = (typeof replaceValue === 'function')
-                                ? function(...args) { return replaceValue.apply(this, args); }
-                                : replaceValue;
-
-                              const rawResult = originalReplace.call(receiver, searchValue, effectiveReplace);
-
-                              if (typeof rawResult === 'string') {
-                                const parsed = tryDecodeBase64ToJsonKeysOnly(rawResult);
-                                if (parsed) {
-                                  waitForRC(() => create(parsed))
-                                }
-                              }
-
-                              return rawResult;
-                            };
-
-                            function findFirstArray(obj) {
-                              let found = null;
-                              (function visit(value) {
-                                if (found) return;
-                                if (value && typeof value === 'object') {
-                                  if (Array.isArray(value)) {
-                                    found = value;
-                                    return;
-                                  }
-                                  for (const k in value) {
-                                    if (Object.prototype.hasOwnProperty.call(value, k)) {
-                                      visit(value[k]);
-                                      if (found) return;
-                                    }
-                                  }
-                                }
-                              })(obj);
-                              return found;
-                            }
-
-                            // Pick the array whose elements look like CDN image URLs.
-                            // Japscan's payload also embeds a path-segments array (e.g.
-                            // ["manga","one-piece","1181"]) that findFirstArray would otherwise grab.
-                            function findImageArray(obj) {
-                              let found = null;
-                              (function visit(value) {
-                                if (found) return;
-                                if (Array.isArray(value) && value.length > 0 &&
-                                    value.every(v => typeof v === 'string' && v.indexOf('c4.japscan.foo') !== -1)) {
-                                  found = value;
-                                  return;
-                                }
-                                if (value && typeof value === 'object') {
-                                  for (const k in value) {
-                                    if (Object.prototype.hasOwnProperty.call(value, k)) {
-                                      visit(value[k]);
-                                      if (found) return;
-                                    }
-                                  }
-                                }
-                              })(obj);
-                              return found;
-                            }
-
-                            function create(parsed) {
-                                if (window.__createCalled) return;
-                                let arr = findImageArray(parsed) || findFirstArray(parsed);
-                                const arrLen = arr ? arr.length : -1;
-                                if (!arr || arr.length === 0) return;
-                                window.__createCalled = true;
-                                const chapterMatch = location.pathname.match(/\/(\d+)(?:\/|$)/);
-                                const chapterNum = chapterMatch ? Number(chapterMatch[1]) : null;
-                                let candidate = null;
-                                (function visit(obj) {
-                                    if (candidate) return;
-                                        if (obj && typeof obj === 'object') {
-                                            for (const k in obj) {
-                                                if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
-                                                const v = obj[k];
-                                                if (typeof v === 'number' && Number.isFinite(v) && Math.floor(v) === v) {
-                                                const n = v;
-                                                if (n > 0 && n <= arrLen && n !== chapterNum) { candidate = n; return; }
-                                            }
-                                            if (typeof v === 'string' && /^[0-9]+$/.test(v)) {
-                                                const n = Number(v);
-                                                if (n > 0 && n <= arrLen && n !== chapterNum) { candidate = n; return; }
-                                            }
-                                            if (typeof v === 'object') visit(v);
-                                            if (candidate) return;
-                                        }
-                                    }
-                                })(parsed);
-                                const finalNum = candidate || chapterNum || 0;
-                                window.$$interfaceName.passPayload(JSON.stringify(arr), window.__rc.p, window.__rc.v, finalNum.toString());
-                            }
+                        """
+                            (function(){
+                                if (window.aclib) return;
+                                window.aclib = {
+                                    runPop: function runPop(){},
+                                    runBanner: function runBanner(){},
+                                    runNative: function runNative(){},
+                                    runInPagePush: function runInPagePush(){},
+                                    isShowingPop: false,
+                                };
+                            })();
                         """.trimIndent(),
-                    ) {}
+                        null,
+                    )
+
+                    // Blob queue hook: captures each decrypted image blob exactly once
+                    view?.evaluateJavascript(
+                        """
+                            (function(){
+                                if (window.__japscanHooked) return;
+                                window.__japscanHooked = true;
+                                window.__japscanBlobQueue = [];
+                                var _seenBlobs = new WeakSet();
+                                var _orig = URL.createObjectURL.bind(URL);
+                                URL.createObjectURL = function(obj){
+                                    var u = _orig(obj);
+                                    try {
+                                        if (obj && obj.type && /^image\//.test(obj.type)) {
+                                            if (!_seenBlobs.has(obj)) {
+                                                _seenBlobs.add(obj);
+                                                window.__japscanBlobQueue.push(u);
+                                            }
+                                        }
+                                    } catch(e) {}
+                                    return u;
+                                };
+                                try {
+                                    URL.createObjectURL.toString = function(){
+                                        return 'function createObjectURL() { [native code] }';
+                                    };
+                                } catch(e) {}
+                            })();
+                        """.trimIndent(),
+                        null,
+                    )
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
-                    // Force-keep the WebView "alive" so its JS timers don't get suspended while
-                    // we're detached. resumeTimers is global to all WebViews in the process.
+                    Log.d("JapscanDebug", "WebView onPageFinished: $url")
                     view?.onResume()
                     view?.resumeTimers()
+
+                    // Driver: drains __japscanBlobQueue and navigates/scrolls to ensure all pages render
+                    view?.evaluateJavascript(
+                        """
+                            (async function(){
+                                if (window.__japscanDriverStarted) return;
+                                window.__japscanDriverStarted = true;
+                                var sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
+
+                                async function saveBlobUrl(u){
+                                    if (!u) return false;
+                                    try {
+                                        var r = await fetch(u);
+                                        var b = await r.blob();
+                                        var d = await new Promise(function(res, rej){
+                                            var fr = new FileReader();
+                                            fr.onload = function(){ res(fr.result); };
+                                            fr.onerror = rej;
+                                            fr.readAsDataURL(b);
+                                        });
+                                        if (typeof d === 'string' && d.indexOf('data:image/') === 0) {
+                                            window.$interfaceName.savePage(d);
+                                            return true;
+                                        }
+                                    } catch(e) {
+                                        console.log('[japscan] saveBlobUrl failed: ' + e);
+                                    } finally {
+                                        try { URL.revokeObjectURL(u); } catch(e) {}
+                                    }
+                                    return false;
+                                }
+
+                                async function drainQueue(){
+                                    var count = 0;
+                                    while (window.__japscanBlobQueue && window.__japscanBlobQueue.length > 0) {
+                                        var u = window.__japscanBlobQueue.shift();
+                                        var ok = await saveBlobUrl(u);
+                                        if (ok) count++;
+                                    }
+                                    return count;
+                                }
+
+                                var isWebtoon = $isWebtoon;
+                                window.$interfaceName.log('driver started, isWebtoon=' + isWebtoon + ', url=' + window.location.href + ', title=' + document.title);
+
+                                if (isWebtoon) {
+                                    var items = [];
+                                    for (var w = 0; w < 40; w++) {
+                                        var fullReader = document.getElementById('full-reader');
+                                        if (fullReader && fullReader.children.length > 0) {
+                                            items = Array.from(fullReader.children);
+                                            break;
+                                        }
+                                        await sleep(250);
+                                    }
+                                    var total = items.length;
+                                    window.$interfaceName.log('webtoon mode, items=' + total);
+                                    if (total === 0) {
+                                        window.__japscanDriverStarted = false;
+                                        return;
+                                    }
+
+                                    var savedSoFar = 0;
+                                    function getSavedCount() {
+                                        try { return window.$interfaceName.getSavedCount(); } catch(e) { return savedSoFar; }
+                                    }
+
+                                    // Trigger lazy rendering by scrolling down through all items
+                                    for (var i = 0; i < items.length; i++) {
+                                        try {
+                                            items[i].scrollIntoView({ block: 'center', behavior: 'instant' });
+                                        } catch(e) {}
+                                        var drained = await drainQueue();
+                                        savedSoFar += drained;
+                                        if (getSavedCount() >= total) break;
+                                        await sleep(200);
+                                    }
+
+                                    // Wait for any remaining items to finish processing
+                                    var idleRounds = 0;
+                                    while (idleRounds < 6 && getSavedCount() < total) {
+                                        var newSaved = await drainQueue();
+                                        if (newSaved > 0) {
+                                            savedSoFar += newSaved;
+                                            idleRounds = 0;
+                                        } else {
+                                            idleRounds++;
+                                        }
+                                        await sleep(400);
+                                    }
+
+                                    console.log('[japscan] webtoon done, saved=' + getSavedCount());
+                                    try { window.$interfaceName.passDone(); } catch(e) {}
+                                    return;
+                                }
+
+                                // Paginated mode for standard mangas
+                                var sel = document.getElementById('pages');
+                                var total = sel ? sel.options.length : 1;
+                                var nextBtn = document.getElementById('block-right');
+                                var prevBtn = document.getElementById('block-left');
+                                console.log('[japscan] paginated mode, total = ' + total);
+
+                                function nav(btn, fallbackKey){
+                                    try {
+                                        if (btn) { btn.click(); return; }
+                                        document.dispatchEvent(new KeyboardEvent('keydown', {
+                                            key: fallbackKey, code: fallbackKey,
+                                            which: fallbackKey === 'ArrowRight' ? 39 : 37,
+                                            keyCode: fallbackKey === 'ArrowRight' ? 39 : 37,
+                                            bubbles: true,
+                                        }));
+                                    } catch(e) {
+                                        console.log('[japscan] nav failed: ' + e);
+                                    }
+                                }
+
+                                async function waitForNextBlob(timeoutMs){
+                                    var w = 0;
+                                    while ((!window.__japscanBlobQueue || window.__japscanBlobQueue.length === 0) && w < timeoutMs) {
+                                        await sleep(100); w += 100;
+                                    }
+                                    if (!window.__japscanBlobQueue || window.__japscanBlobQueue.length === 0) return null;
+                                    return window.__japscanBlobQueue.shift();
+                                }
+
+                                await waitForNextBlob(10000);
+                                window.__japscanBlobQueue = [];
+
+                                nav(nextBtn, 'ArrowRight');
+                                await waitForNextBlob(8000);
+                                window.__japscanBlobQueue = [];
+
+                                nav(prevBtn, 'ArrowLeft');
+                                var u0 = await waitForNextBlob(8000);
+                                if (total > 1) nav(nextBtn, 'ArrowRight');
+                                if (u0) await saveBlobUrl(u0);
+
+                                for (var i = 1; i < total; i++) {
+                                    var u = await waitForNextBlob(8000);
+                                    if (i < total - 1) nav(nextBtn, 'ArrowRight');
+                                    if (u) await saveBlobUrl(u);
+                                }
+
+                                await drainQueue();
+                                console.log('[japscan] paginated done');
+                                try {
+                                    window.$interfaceName.passDone();
+                                } catch(e) {
+                                    console.log('[japscan] passDone failed: ' + e);
+                                }
+                            })();
+                        """.trimIndent(),
+                        null,
+                    )
                 }
             }
 
+            val initialUrl = if (isWebtoon && chapter.url.endsWith("/")) {
+                "$internalBaseUrl${chapter.url}1.html"
+            } else {
+                "$internalBaseUrl${chapter.url}"
+            }
             innerWv.loadUrl(
-                "$internalBaseUrl${chapter.url}",
+                initialUrl,
                 headers.toMap(),
             )
         }
 
-        latch.await(30, TimeUnit.SECONDS)
+        val deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(3)
+        var done = false
+        while (!done && System.currentTimeMillis() < deadline) {
+            done = latch.await(5, TimeUnit.SECONDS)
+            if (!done && System.currentTimeMillis() - jsInterface.lastActivity > 45_000L) {
+                Log.d("JapscanDebug", "No page saved in 45s, timing out")
+                break
+            }
+        }
         handler.post { webView?.destroy() }
 
-        if (latch.count == 1L) {
+        if (latch.count == 1L && jsInterface.snapshot().isEmpty()) {
             throw Exception("Erreur lors de la récupération des pages")
         }
-        val baseUrlHost = internalBaseUrl.toHttpUrl().host.substringAfter("www.")
-        val images = jsInterface.images
-            .filter { it.toHttpUrl().host.endsWith(baseUrlHost) }
-            .mapIndexed { i, url ->
-                if (i != jsInterface.pi) {
-                    Page(i, imageUrl = "$url&${jsInterface.p}=${jsInterface.v}")
-                } else {
-                    null
-                }
-            }
-            .filterNotNull()
-        return Observable.just(images)
+
+        val pages = jsInterface.snapshot().mapIndexed { i, path ->
+            Page(i, imageUrl = "https://$JAPSCAN_CACHE_HOST$path")
+        }
+        Log.d("JapscanDebug", "Delivering ${pages.size} verified pages to reader!")
+        return Observable.just(pages)
     }
 
     override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException("Not used")
@@ -655,34 +852,73 @@ abstract class Japscan :
         screen.addPreference(chapterListPref)
     }
 
+    private fun sweepPageCache(cacheDir: File) {
+        val cutoff = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(24)
+        cacheDir.listFiles()?.forEach {
+            if (it.name.startsWith(CACHE_FILE_PREFIX) && it.lastModified() < cutoff) it.delete()
+        }
+    }
+
     private fun randomString(length: Int = 10): String {
         val charPool = ('a'..'z') + ('A'..'Z')
         return List(length) { charPool.random() }.joinToString("")
     }
 
-    internal class JsInterface(private val latch: CountDownLatch) {
-        var images: List<String> = listOf()
+    internal class JsInterface(
+        private val latch: CountDownLatch,
+        private val cacheDir: File,
+    ) {
+        @Volatile
+        var lastActivity: Long = System.currentTimeMillis()
             private set
-        var p: String = ""
-            private set
-        var v: String = ""
-            private set
-        var pi: Int = -1
-            private set
+
+        private val savedPaths = mutableListOf<String>()
+        private val savedHashes = mutableSetOf<String>()
+        private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}"
+
+        fun snapshot(): List<String> = synchronized(savedPaths) { savedPaths.toList() }
 
         @JavascriptInterface
         @Suppress("UNUSED")
-        fun passPayload(rawData: String, p: String, v: String, pi: String) {
+        fun savePage(dataUri: String) {
+            lastActivity = System.currentTimeMillis()
             try {
-                images = rawData.parseAs<List<String>>()
-                    .map { "$it?y=1" }
-                this.p = p
-                this.v = v
-                this.pi = pi.toInt()
-                latch.countDown()
-            } catch (_: Exception) {
-                return
+                val commaIdx = dataUri.indexOf(',')
+                if (commaIdx <= 0) return
+                val base64 = dataUri.substring(commaIdx + 1)
+                val bytes = Base64.decode(base64, Base64.DEFAULT)
+                val md = MessageDigest.getInstance("SHA-256")
+                val hash = md.digest(bytes).joinToString("") { "%02x".format(it) }
+                synchronized(savedPaths) {
+                    if (!savedHashes.add(hash)) {
+                        Log.d("JapscanDebug", "Skipping duplicate page (hash: ${hash.take(8)})")
+                        return
+                    }
+                    val file = File(cacheDir, "$sessionTag-${savedPaths.size}.bin")
+                    file.writeBytes(bytes)
+                    savedPaths.add(file.absolutePath)
+                    Log.d("JapscanDebug", "Saved page #${savedPaths.size} to ${file.absolutePath} (${bytes.size} bytes)")
+                }
+            } catch (e: Exception) {
+                Log.e("JapscanDebug", "Failed to save page", e)
             }
+        }
+
+        @JavascriptInterface
+        @Suppress("UNUSED")
+        fun getSavedCount(): Int = synchronized(savedPaths) { savedPaths.size }
+
+        @JavascriptInterface
+        @Suppress("UNUSED")
+        fun log(msg: String) {
+            Log.d("JapscanDebug", "[FromJS] $msg")
+        }
+
+        @JavascriptInterface
+        @Suppress("UNUSED")
+        fun passDone() {
+            Log.d("JapscanDebug", "passDone received! Total pages saved: ${savedPaths.size}")
+            latch.countDown()
         }
     }
 }
