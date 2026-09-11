@@ -414,7 +414,7 @@ abstract class Japscan :
 
     private fun parseChapterDate(date: String) = dateFormat.tryParse(date)
 
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.fromCallable {
         val interfaceName = randomString()
         val context = Injekt.get<Application>()
         val isReader = Exception().stackTrace.any { it.className.contains("reader") }
@@ -610,6 +610,7 @@ abstract class Japscan :
                                 window.__japscanHooked = true;
                                 window.__japscanBlobQueue = [];
                                 var _seenBlobs = new WeakSet();
+                                var _seenSignatures = new Set();
                                 var _orig = URL.createObjectURL.bind(URL);
                                 URL.createObjectURL = function(obj){
                                     var u = _orig(obj);
@@ -617,7 +618,27 @@ abstract class Japscan :
                                         if (obj && obj.type && /^image\//.test(obj.type)) {
                                             if (!_seenBlobs.has(obj)) {
                                                 _seenBlobs.add(obj);
-                                                window.__japscanBlobQueue.push(u);
+                                                // Check size-based fingerprint asynchronously
+                                                (async function(){
+                                                    try {
+                                                        var sigKey = obj.size + '_' + obj.type;
+                                                        var slice = obj.slice(0, 64);
+                                                        var buf = await slice.arrayBuffer();
+                                                        var view = new Uint8Array(buf);
+                                                        var sample = '';
+                                                        for (var i = 0; i < view.length; i++) sample += view[i].toString(16);
+                                                        var fullSig = sigKey + '_' + sample;
+                                                        if (_seenSignatures.has(fullSig)) {
+                                                            return;
+                                                        }
+                                                        _seenSignatures.add(fullSig);
+                                                        window.__japscanBlobQueue.push(u);
+                                                        window.dispatchEvent(new CustomEvent('japscan:blob'));
+                                                    } catch(e) {
+                                                        window.__japscanBlobQueue.push(u);
+                                                        window.dispatchEvent(new CustomEvent('japscan:blob'));
+                                                    }
+                                                })();
                                             }
                                         }
                                     } catch(e) {}
@@ -647,6 +668,45 @@ abstract class Japscan :
                                 if (window.__japscanDriverStarted) return;
                                 window.__japscanDriverStarted = true;
                                 var sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
+
+                                function waitForElement(predicate, timeoutMs) {
+                                    return new Promise(function(resolve) {
+                                        var existing = predicate();
+                                        if (existing) { resolve(existing); return; }
+                                        var timer = setTimeout(function() {
+                                            if (observer) observer.disconnect();
+                                            resolve(null);
+                                        }, timeoutMs || 10000);
+                                        var observer = new MutationObserver(function() {
+                                            var found = predicate();
+                                            if (found) {
+                                                clearTimeout(timer);
+                                                observer.disconnect();
+                                                resolve(found);
+                                            }
+                                        });
+                                        observer.observe(document.documentElement, { childList: true, subtree: true });
+                                    });
+                                }
+
+                                function waitForBlobEvent(timeoutMs) {
+                                    return new Promise(function(resolve) {
+                                        if (window.__japscanBlobQueue && window.__japscanBlobQueue.length > 0) {
+                                            resolve(true);
+                                            return;
+                                        }
+                                        var timer = setTimeout(function() {
+                                            window.removeEventListener('japscan:blob', onBlob);
+                                            resolve(false);
+                                        }, timeoutMs || 6000);
+                                        function onBlob() {
+                                            clearTimeout(timer);
+                                            window.removeEventListener('japscan:blob', onBlob);
+                                            resolve(true);
+                                        }
+                                        window.addEventListener('japscan:blob', onBlob);
+                                    });
+                                }
 
                                 async function saveBlobUrl(u){
                                     if (!u) return false;
@@ -685,15 +745,12 @@ abstract class Japscan :
                                 window.$interfaceName.log('driver started, isWebtoon=' + isWebtoon + ', url=' + window.location.href + ', title=' + document.title);
 
                                 if (isWebtoon) {
-                                    var items = [];
-                                    for (var w = 0; w < 40; w++) {
-                                        var fullReader = document.getElementById('full-reader');
-                                        if (fullReader && fullReader.children.length > 0) {
-                                            items = Array.from(fullReader.children);
-                                            break;
-                                        }
-                                        await sleep(250);
-                                    }
+                                    var fullReader = await waitForElement(function() {
+                                        var el = document.getElementById('full-reader');
+                                        return (el && el.children.length > 0) ? el : null;
+                                    }, 10000);
+
+                                    var items = fullReader ? Array.from(fullReader.children) : [];
                                     var total = items.length;
                                     window.$interfaceName.log('webtoon mode, items=' + total);
                                     if (total === 0) {
@@ -735,61 +792,68 @@ abstract class Japscan :
                                     return;
                                 }
 
-                                // Paginated mode for standard mangas
-                                var sel = document.getElementById('pages');
-                                var total = sel ? sel.options.length : 1;
+                                // Paginated mode for standard mangas: event-driven DOM readiness
+                                var sel = await waitForElement(function() {
+                                    var s = document.getElementById('pages');
+                                    return (s && s.options.length > 1) ? s : null;
+                                }, 10000);
+
+                                if (!sel) {
+                                    window.$interfaceName.log('Timeout waiting for #pages (DOM blocked or not ready)');
+                                    window.__japscanDriverStarted = false;
+                                    return;
+                                }
+
+                                var total = sel.options.length;
                                 var nextBtn = document.getElementById('block-right');
-                                var prevBtn = document.getElementById('block-left');
-                                console.log('[japscan] paginated mode, total = ' + total);
+                                window.$interfaceName.log('event-driven paginated mode started, total = ' + total);
 
-                                function nav(btn, fallbackKey){
+                                function navNext(){
                                     try {
-                                        if (btn) { btn.click(); return; }
+                                        if (nextBtn) { nextBtn.click(); return; }
                                         document.dispatchEvent(new KeyboardEvent('keydown', {
-                                            key: fallbackKey, code: fallbackKey,
-                                            which: fallbackKey === 'ArrowRight' ? 39 : 37,
-                                            keyCode: fallbackKey === 'ArrowRight' ? 39 : 37,
-                                            bubbles: true,
+                                            key: 'ArrowRight', code: 'ArrowRight', which: 39, keyCode: 39, bubbles: true
                                         }));
-                                    } catch(e) {
-                                        console.log('[japscan] nav failed: ' + e);
+                                    } catch(e) {}
+                                }
+
+                                function getSavedCount() {
+                                    try { return window.$interfaceName.getSavedCount(); } catch(e) { return 0; }
+                                }
+
+                                // Background consumer: saves blobs as fast as they arrive
+                                var consumerActive = true;
+                                var consumerPromise = (async function(){
+                                    while (consumerActive || (window.__japscanBlobQueue && window.__japscanBlobQueue.length > 0)) {
+                                        await drainQueue();
+                                        if (getSavedCount() >= total) break;
+                                        await sleep(20);
+                                    }
+                                })();
+
+                                // Event-driven producer: advances immediately upon blob event
+                                for (var i = 0; i < total; i++) {
+                                    if (window.__japscanBlobQueue.length === 0 && getSavedCount() <= i) {
+                                        await waitForBlobEvent(5000);
+                                    }
+                                    if (i < total - 1 && getSavedCount() < total) {
+                                        navNext();
                                     }
                                 }
 
-                                async function waitForNextBlob(timeoutMs){
-                                    var w = 0;
-                                    while ((!window.__japscanBlobQueue || window.__japscanBlobQueue.length === 0) && w < timeoutMs) {
-                                        await sleep(100); w += 100;
-                                    }
-                                    if (!window.__japscanBlobQueue || window.__japscanBlobQueue.length === 0) return null;
-                                    return window.__japscanBlobQueue.shift();
+                                // Final drain & check
+                                var idle = 0;
+                                while (idle < 8 && getSavedCount() < total) {
+                                    var before = getSavedCount();
+                                    await sleep(200);
+                                    if (getSavedCount() > before) idle = 0; else idle++;
                                 }
-
-                                await waitForNextBlob(10000);
-                                window.__japscanBlobQueue = [];
-
-                                nav(nextBtn, 'ArrowRight');
-                                await waitForNextBlob(8000);
-                                window.__japscanBlobQueue = [];
-
-                                nav(prevBtn, 'ArrowLeft');
-                                var u0 = await waitForNextBlob(8000);
-                                if (total > 1) nav(nextBtn, 'ArrowRight');
-                                if (u0) await saveBlobUrl(u0);
-
-                                for (var i = 1; i < total; i++) {
-                                    var u = await waitForNextBlob(8000);
-                                    if (i < total - 1) nav(nextBtn, 'ArrowRight');
-                                    if (u) await saveBlobUrl(u);
-                                }
-
+                                consumerActive = false;
+                                await consumerPromise;
                                 await drainQueue();
-                                console.log('[japscan] paginated done');
-                                try {
-                                    window.$interfaceName.passDone();
-                                } catch(e) {
-                                    console.log('[japscan] passDone failed: ' + e);
-                                }
+
+                                window.$interfaceName.log('event-driven paginated mode done, saved = ' + getSavedCount());
+                                try { window.$interfaceName.passDone(); } catch(e) {}
                             })();
                         """.trimIndent(),
                         null,
@@ -797,10 +861,11 @@ abstract class Japscan :
                 }
             }
 
-            val initialUrl = if (isWebtoon && chapter.url.endsWith("/")) {
-                "$internalBaseUrl${chapter.url}1.html"
+            val cleanChapterUrl = chapter.url.trimEnd('/')
+            val initialUrl = if (!cleanChapterUrl.endsWith(".html")) {
+                "$internalBaseUrl$cleanChapterUrl/1.html"
             } else {
-                "$internalBaseUrl${chapter.url}"
+                "$internalBaseUrl$cleanChapterUrl"
             }
             innerWv.loadUrl(
                 initialUrl,
@@ -827,7 +892,7 @@ abstract class Japscan :
             Page(i, imageUrl = "https://$JAPSCAN_CACHE_HOST$path")
         }
         Log.d("JapscanDebug", "Delivering ${pages.size} verified pages to reader!")
-        return Observable.just(pages)
+        pages
     }
 
     override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException("Not used")
