@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Japscan"
-    versionCode = 73
+    versionCode = 71
     contentWarning = ContentWarning.SAFE
     libVersion = "1.4"
 
@@ -15,4 +15,8 @@ keiyoushi {
         baseUrl = "https://www.japscan.foo/mangas/?sort=popular&p=1"
         id = 11L
     }
+}
+
+dependencies {
+    implementation(project(":lib:twocaptcha"))
 }

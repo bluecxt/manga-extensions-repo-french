@@ -28,6 +28,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.annotation.Source
+import keiyoushi.lib.twocaptcha.TwoCaptcha
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferencesLazy
@@ -52,7 +53,6 @@ import rx.Observable
 import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 import java.io.File
-import java.io.IOException
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -85,17 +85,9 @@ abstract class Japscan :
                     .body((bytes ?: ByteArray(0)).toResponseBody("image/jpeg".toMediaType()))
                     .build()
             }
-            val response = chain.proceed(req)
-            if (response.code in listOf(403, 503)) {
-                val isCf = response.header("Server")?.contains("cloudflare", ignoreCase = true) == true ||
-                    response.header("cf-ray") != null ||
-                    response.peekBody(1024).string().contains("Just a moment", ignoreCase = true)
-                if (isCf) {
-                    throw IOException("Cloudflare challenge détecté (HTTP ${response.code}). Ouvrez dans la WebView pour résoudre.")
-                }
-            }
-            response
+            chain.proceed(req)
         }
+        .addInterceptor(TwoCaptcha.createCloudflareInterceptor(::twoCaptchaApiKey))
         .rateLimit(1, 2.seconds)
         .build()
 
@@ -141,6 +133,9 @@ abstract class Japscan :
         private const val SHOW_SPOILER_CHAPTERS = "JAPSCAN_SPOILER_CHAPTERS"
         private val prefsEntries = arrayOf("Montrer uniquement les chapitres traduit en Français", "Montrer les chapitres spoiler")
         private val prefsEntryValues = arrayOf("hide", "show")
+
+        private const val TWOCAPTCHA_API_KEY = "TWOCAPTCHA_API_KEY"
+        private const val TWOCAPTCHA_API_KEY_TITLE = "Clé API 2Captcha (Résolution Cloudflare Turnstile)"
     }
 
     private fun chapterListPref() = preferences.getString(SHOW_SPOILER_CHAPTERS, "hide")
@@ -550,7 +545,7 @@ abstract class Japscan :
 
         val urlSegment = chapter.url.trimStart('/').substringBefore('/').lowercase()
         val isWebtoon = urlSegment == "manhwa" || urlSegment == "manhua"
-        val jsInterface = JsInterface(latch, context.cacheDir)
+        val jsInterface = JsInterface(latch, context.cacheDir, handler) { webView }
 
         handler.post {
             // Synchronize cookies from OkHttp client to Android WebView CookieManager
@@ -599,6 +594,12 @@ abstract class Japscan :
                                 };
                             })();
                         """.trimIndent(),
+                        null,
+                    )
+
+                    // Cloudflare Turnstile interceptor (2Captcha)
+                    view?.evaluateJavascript(
+                        TwoCaptcha.turnstileInterceptorScript(interfaceName),
                         null,
                     )
 
@@ -904,6 +905,8 @@ abstract class Japscan :
 
     private class PageList(pages: Array<Int>) : Filter.Select<Int>("Page #", arrayOf(0, *pages))
 
+    private fun twoCaptchaApiKey() = preferences.getString(TWOCAPTCHA_API_KEY, "")?.trim().orEmpty()
+
     // Prefs
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val chapterListPref = ListPreference(screen.context).apply {
@@ -915,6 +918,13 @@ abstract class Japscan :
             setDefaultValue("hide")
         }
         screen.addPreference(chapterListPref)
+
+        TwoCaptcha.addPreferenceToScreen(
+            screen = screen,
+            currentKey = twoCaptchaApiKey(),
+            title = TWOCAPTCHA_API_KEY_TITLE,
+            key = TWOCAPTCHA_API_KEY,
+        )
     }
 
     private fun sweepPageCache(cacheDir: File) {
@@ -929,14 +939,17 @@ abstract class Japscan :
         return List(length) { charPool.random() }.joinToString("")
     }
 
-    internal class JsInterface(
+    internal inner class JsInterface(
         private val latch: CountDownLatch,
         private val cacheDir: File,
+        private val handler: Handler,
+        private val webViewProvider: () -> WebView?,
     ) {
         @Volatile
         var lastActivity: Long = System.currentTimeMillis()
             private set
 
+        private val tsSolvingStarted = java.util.concurrent.atomic.AtomicBoolean(false)
         private val savedPaths = mutableListOf<String>()
         private val savedHashes = mutableSetOf<String>()
         private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}"
@@ -977,6 +990,47 @@ abstract class Japscan :
         @Suppress("UNUSED")
         fun log(msg: String) {
             Log.d("JapscanDebug", "[FromJS] $msg")
+        }
+
+        @JavascriptInterface
+        @Suppress("UNUSED")
+        fun onTurnstileDetected(payloadJson: String) {
+            val solver = TwoCaptcha(twoCaptchaApiKey(), client)
+            if (!solver.isConfigured) {
+                Log.d("JapscanDebug", "Turnstile challenge detected, but 2Captcha API key is not configured.")
+                return
+            }
+            // Avoid duplicate parallel solving tasks
+            if (tsSolvingStarted.getAndSet(true)) return
+
+            Thread {
+                try {
+                    Log.d("JapscanDebug", "Starting 2Captcha Turnstile solver...")
+                    val json = kotlinx.serialization.json.Json.parseToJsonElement(payloadJson).jsonObject
+                    val token = solver.solveTurnstile(
+                        websiteUrl = json["url"]!!.string,
+                        websiteKey = json["sitekey"]!!.string,
+                        action = json["action"]?.string.orEmpty().ifEmpty { "managed" },
+                        data = json["data"]?.string.orEmpty(),
+                        pagedata = json["pagedata"]?.string.orEmpty(),
+                        userAgent = json["userAgent"]?.string.orEmpty(),
+                    )
+
+                    if (!token.isNullOrEmpty()) {
+                        Log.d("JapscanDebug", "2Captcha solved Turnstile successfully! Injecting token...")
+                        handler.post {
+                            webViewProvider()?.evaluateJavascript(
+                                "if (window.__tsCallback) { window.__tsCallback('$token'); }",
+                                null,
+                            )
+                        }
+                    } else {
+                        Log.d("JapscanDebug", "2Captcha failed to solve Turnstile within timeout.")
+                    }
+                } catch (e: Exception) {
+                    Log.e("JapscanDebug", "2Captcha Turnstile solver error", e)
+                }
+            }.start()
         }
 
         @JavascriptInterface
