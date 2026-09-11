@@ -834,7 +834,7 @@ abstract class Japscan :
                                 // Event-driven producer: advances immediately upon blob event
                                 for (var i = 0; i < total; i++) {
                                     if (window.__japscanBlobQueue.length === 0 && getSavedCount() <= i) {
-                                        await waitForBlobEvent(5000);
+                                        await waitForBlobEvent(200);
                                     }
                                     if (i < total - 1 && getSavedCount() < total) {
                                         navNext();
