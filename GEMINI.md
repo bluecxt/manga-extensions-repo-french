@@ -84,9 +84,14 @@ git restore --source=yuzono/main -- src/fr/nouvelle_extension
   - Intercepteur OkHttp global avec résolution headless 2Captcha et rejeu automatique (`createCloudflareInterceptor`).
   - Déchiffrement et chargement des pages via WebView dédiée (mangas paginés et manhwas/webtoons), déduplication SHA-256 et cache local.
   - **Ne JAMAIS écraser ou synchroniser aveuglément Japscan depuis `upstream`** sans préserver explicitement ces modifications custom.
+- **`src/all/niadd`** : Modifiée pour corriger le formatage et l'ordre des chapitres :
+  - Parsing corrigé du nom de chapitre ciblant `span.chp-title` (évite de concaténer vues et date dans le titre).
+  - Parsing étendu du numéro de chapitre (`CHAPTER_NUMBER_REGEX` gérant Vol/Volume, Ch/Chapitre, Capitulo).
+  - Tri automatique descendant par `chapter_number` dans `chapterListParse` pour corriger les chapitres mal ordonnés sur le site.
+  - **Ne pas écraser aveuglément depuis `upstream`** sans préserver ces correctifs de tri et parsing.
 
 ## Mandats Spécifiques pour Gemini
 - Toujours vérifier `exclude_build.json` avant de se plaindre d'un build manquant.
 - Ne jamais restaurer les extensions supprimées (Dynasty, etc.) sans confirmation explicite.
-- Ne jamais écraser ou réinitialiser `src/fr/japscan` avec l'upstream sans intégrer ses composants custom (`lib:twocaptcha`, WebView reader driver, déduplication, intercepteur Cloudflare).
+- Ne jamais écraser ou réinitialiser `src/fr/japscan` ou `src/all/niadd` avec l'upstream sans préserver leurs composants et correctifs custom.
 - Maintenir la compatibilité `repo.json` pour Komikku lors de chaque modification du workflow de build.

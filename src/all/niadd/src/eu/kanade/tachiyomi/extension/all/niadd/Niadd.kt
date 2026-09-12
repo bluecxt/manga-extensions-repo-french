@@ -25,7 +25,7 @@ abstract class Niadd : HttpSource() {
     companion object {
         private val ALL_IMGS_URL_REGEX = Regex("""all_imgs_url\s*:\s*\[([\s\S]*?)\]""")
         private val CLEAN_IMG_URL_REGEX = Regex("""["'\s]""")
-        private val CHAPTER_NUMBER_REGEX = Regex("""Capítulo\s+(\d+(\.\d+)?)""")
+        private val CHAPTER_NUMBER_REGEX = Regex("""(?:vol(?:ume)?\.?\s*(\d+)|(?:ch(?:apitre)?|cap[ií]tulo)?\s*(\d+(?:\.\d+)?))""", RegexOption.IGNORE_CASE)
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
@@ -158,22 +158,31 @@ abstract class Niadd : HttpSource() {
         val document = response.asJsoup()
         document.selectFirst("ul.chapter-list")!!
 
-        return document.select(chapterListSelector).map { chapterFromElement(it) }
+        return document.select(chapterListSelector)
+            .map { chapterFromElement(it) }
+            .sortedWith(
+                compareByDescending<SChapter> { it.chapter_number.takeIf { num -> num >= 0f } ?: -1f },
+            )
     }
 
     private fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
         val rawUrl = element.attr("abs:href")
         setUrlWithoutDomain(rawUrl)
 
-        name = element.selectFirst("span.chapter-name, span.name")?.text()
+        val rawName = element.selectFirst("span.chp-title")?.text()
             ?.takeIf(String::isNotEmpty)
+            ?: element.attr("title").takeIf(String::isNotEmpty)
+            ?: element.selectFirst("span.chapter-name, span.name")?.text()
             ?: element.text()
 
-        element.selectFirst("span.chapter-time, span.time")?.text()
+        name = rawName
+
+        element.selectFirst("span.chp-time, span.chapter-time, span.time")?.text()
             ?.also { date_upload = parseDate(it) }
 
-        chapter_number = CHAPTER_NUMBER_REGEX.find(name)
-            ?.groupValues?.get(1)?.toFloatOrNull() ?: -1f
+        chapter_number = CHAPTER_NUMBER_REGEX.find(name)?.let { match ->
+            (match.groups[1] ?: match.groups[2])?.value?.toFloatOrNull()
+        } ?: -1f
     }
 
     // Pages
