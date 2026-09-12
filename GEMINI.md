@@ -34,7 +34,59 @@ Ajouter son identifiant au format `lang.nom` (ex: `fr.mangakawaii`) ou un patter
 L'URL du catalogue pour Mihon/Tachiyomi/Komikku est :
 `https://raw.githubusercontent.com/bluecxt/manga-extensions-repo-french/repo/index.min.json`
 
+### Synchronisation depuis les Remotes Upstream
+
+Les dépôts parents configurés :
+- **yuzono** : `https://github.com/yuzono/tachiyomi-extensions.git` (Branche par défaut : `main` ou `keiyoushi`)
+- **cursed** : `https://github.com/yuzono/cursed-manga-extensions.git` (Branche : `master`)
+
+#### Dernière Maintenance
+- **Date :** 12 Septembre 2026
+- **État :**
+  - Remotes `yuzono` et `cursed` synchronisés via `git fetch --all`.
+  - `cursed` (`master`) : Aucune mise à jour en attente pour nhentai, ehentai, hitomi, pururin (à jour).
+  - `yuzono` (`main`) : Mises à jour upstream identifiées disponibles :
+    - `src/fr/hentaiscantrad` : Changement d'URL vers `https://hentai-scantrad.org` (`versionCode = 2`).
+    - `src/fr/sushiscan`, `kiwiyascans`, `lelmanga`, `sushiscanfr` : Migration du multisrc MangaThemesia vers `libVersion = 1.6`.
+    - `src/all/mangadex` : Migration vers `libVersion = 1.6` (commit upstream `27de046353`).
+    - `src/all/mangaball` : Refactoring et nettoyage code.
+    - `src/fr/japscan` : Protégé et non écrasé (fork custom avec `lib:twocaptcha`, intercepteur Cloudflare et lecteur déchiffré).
+
+#### Commandes Utiles
+```bash
+# 1. Mettre à jour les informations des dépôts distants
+git fetch --all
+
+# 2. Comparer les changements avant import
+git diff main yuzono/main -- src/all/mangadex
+git diff main cursed/master -- src/all/nhentai
+
+# 3. Mettre à jour une extension standard (Surgical Update)
+git restore --source=yuzono/main -- src/fr/mangakawaii
+git restore --source=cursed/master -- src/all/nhentai
+
+# 4. Ajouter une nouvelle extension depuis un parent
+git restore --source=yuzono/main -- src/fr/nouvelle_extension
+```
+
+#### Aide-mémoire des Sources par Extension
+| Extension | Source Remote | Chemin Source |
+| :--- | :--- | :--- |
+| **La majorité (FR/EN/ALL)** | `yuzono` | `src/...` |
+| **nhentai** | `cursed` | `src/all/nhentai` |
+| **ehentai** | `cursed` | `src/all/ehentai` |
+| **hitomi** | `cursed` | `src/all/hitomi` |
+| **pururin** | `cursed` | `src/all/pururin` |
+
+### Extensions Custom / Modifiées (Ne pas écraser depuis l'upstream)
+- **`src/fr/japscan`** : Fortement personnalisée et divergente de l'upstream Keiyoushi :
+  - Intègre la bibliothèque locale `lib:twocaptcha` (résolution automatique Cloudflare Turnstile).
+  - Intercepteur OkHttp global avec résolution headless 2Captcha et rejeu automatique (`createCloudflareInterceptor`).
+  - Déchiffrement et chargement des pages via WebView dédiée (mangas paginés et manhwas/webtoons), déduplication SHA-256 et cache local.
+  - **Ne JAMAIS écraser ou synchroniser aveuglément Japscan depuis `upstream`** sans préserver explicitement ces modifications custom.
+
 ## Mandats Spécifiques pour Gemini
 - Toujours vérifier `exclude_build.json` avant de se plaindre d'un build manquant.
 - Ne jamais restaurer les extensions supprimées (Dynasty, etc.) sans confirmation explicite.
+- Ne jamais écraser ou réinitialiser `src/fr/japscan` avec l'upstream sans intégrer ses composants custom (`lib:twocaptcha`, WebView reader driver, déduplication, intercepteur Cloudflare).
 - Maintenir la compatibilité `repo.json` pour Komikku lors de chaque modification du workflow de build.
