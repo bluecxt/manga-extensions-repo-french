@@ -41,16 +41,22 @@ Les dépôts parents configurés :
 - **cursed** : `https://github.com/yuzono/cursed-manga-extensions.git` (Branche : `master`)
 
 #### Dernière Maintenance
-- **Date :** 12 Septembre 2026
+- **Date :** 2 Octobre 2026
 - **État :**
   - Remotes `yuzono` et `cursed` synchronisés via `git fetch --all`.
-  - `cursed` (`master`) : Aucune mise à jour en attente pour nhentai, ehentai, hitomi, pururin (à jour).
-  - `yuzono` (`main`) : Mises à jour upstream identifiées disponibles :
-    - `src/fr/hentaiscantrad` : Changement d'URL vers `https://hentai-scantrad.org` (`versionCode = 2`).
-    - `src/fr/sushiscan`, `kiwiyascans`, `lelmanga`, `sushiscanfr` : Migration du multisrc MangaThemesia vers `libVersion = 1.6`.
-    - `src/all/mangadex` : Migration vers `libVersion = 1.6` (commit upstream `27de046353`).
-    - `src/all/mangaball` : Refactoring et nettoyage code.
-    - `src/fr/japscan` : Protégé et non écrasé (fork custom avec `lib:twocaptcha`, intercepteur Cloudflare et lecteur déchiffré).
+  - `core` : Synchronisé avec l'upstream (`keiyoushi.zip.coroutines`, `ProtobufDecoder/Encoder`).
+  - `lib/` : Bibliothèques `publus`, `speedbinb`, `e4p` mises à jour avec les optimisations upstream.
+  - `lib-multisrc/` : Thèmes `mangathemesia`, `fuzzydoodle`, `mmrcms`, `galleryadults`, `madara` migrés vers `libVersion = 1.6`.
+  - **Extensions mises à jour (libVersion = 1.6) :**
+    - `src/fr/` : `animesama`, `aralosbd`, `bigsolo`, `furyosquad`, `hentaiscantrad` (nouvelle URL `https://hentai-scantrad.org`), `kiwiyascans`, `lanortrad` (nouvelle structure), `lelmanga`, `lelscanvf`, `lesporoiniens`, `mangakawaii` (V5), `mangamoins`, `scanr`, `scantradunion`, `scanvf`, `sushiscan`, `sushiscanfr`.
+    - `src/en/` : `readcomicsonline` (MMRCMS 1.6 + recherche étendue).
+    - `src/all/` : `akuma`, `hennojin`, `hentaienvy`, `hentaizap`, `mangaball`, `mangadex`, `mangamillion` (réécriture protobuf et 100+ langues), `mangaplus`, `pandachaika`.
+  - **Extensions spécifiques :**
+    - `src/all/niadd` : Migrée vers `libVersion = 1.6` tout en préservant les correctifs custom (tri descendant des chapitres, `CHAPTER_NUMBER_REGEX` multi-langues, parsing `span.chp-title`), incrémentée à `versionCode = 4`.
+    - `src/fr/perfscan` : Supprimée et consignée dans `exclude_build.json` (site mort / nom de domaine inexistant upstream #19555).
+    - `src/fr/japscan` : Protégée et préservée (fork custom avec `lib:twocaptcha`, Cloudflare Turnstile solver et lecteur déchiffré).
+    - `cursed` (`master`) : `src/all/nhentai`, `ehentai`, `hitomi`, `pururin` synchronisés et conformes à `cursed/master`.
+  - Validation du build : `compileDebugKotlin` validé avec succès (exit code 0 sur tous les modules).
 
 #### Commandes Utiles
 ```bash
