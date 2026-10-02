@@ -1,45 +1,49 @@
 package eu.kanade.tachiyomi.extension.fr.japscan
 
-import android.app.Application
+import android.annotation.SuppressLint
 import android.content.ComponentName
 import android.content.Intent
-import android.content.SharedPreferences
 import android.graphics.Bitmap
-import android.os.Handler
-import android.os.Looper
 import android.util.Base64
 import android.util.Log
-import android.webkit.ConsoleMessage
-import android.webkit.CookieManager
+import android.view.View
 import android.webkit.JavascriptInterface
-import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
-import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
+import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.lib.twocaptcha.TwoCaptcha
+import keiyoushi.network.get
+import keiyoushi.network.post
 import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
+import keiyoushi.utils.applicationContext
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.string
+import keiyoushi.utils.runWebView
 import keiyoushi.utils.toJsonString
-import keiyoushi.utils.tryParse
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonObject
+import keiyoushi.utils.tryParseDate
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.CacheControl
 import okhttp3.FormBody
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -48,215 +52,121 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import rx.Observable
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
+import java.io.ByteArrayInputStream
 import java.io.File
-import java.security.MessageDigest
-import java.text.SimpleDateFormat
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.Collections
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 
 @Source
 abstract class Japscan :
-    HttpSource(),
+    KeiSource(),
     ConfigurableSource {
 
-    private val internalBaseUrl = "https://www.japscan.foo"
+    private val preferences by getPreferencesLazy()
 
-    override val supportsLatest = true
-
-    private val preferences: SharedPreferences by getPreferencesLazy()
-
-    override val client: OkHttpClient = network.client.newBuilder()
-        .addInterceptor { chain ->
-            val req = chain.request()
-            if (req.url.host == JAPSCAN_CACHE_HOST) {
-                val path = "/" + req.url.pathSegments.joinToString("/")
-                val bytes = runCatching { File(path).readBytes() }.getOrNull()
-                return@addInterceptor Response.Builder()
-                    .request(req)
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(if (bytes != null) 200 else 404)
-                    .message(if (bytes != null) "OK" else "Not Found")
-                    .body((bytes ?: ByteArray(0)).toResponseBody("image/jpeg".toMediaType()))
-                    .build()
-            }
-            chain.proceed(req)
+    // Pages are captured from the reader's canvases and spooled to the cache dir; their imageUrl
+    // points at a sentinel host that this interceptor serves from disk, ahead of the rate limiter.
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = apply {
+        addInterceptor(TwoCaptcha.createCloudflareInterceptor(::twoCaptchaApiKey))
+        addInterceptor { chain ->
+            val request = chain.request()
+            if (request.url.host != CACHE_HOST) return@addInterceptor chain.proceed(request)
+            val bytes = File("/" + request.url.pathSegments.joinToString("/")).takeIf(File::exists)?.readBytes()
+            Response.Builder()
+                .request(request)
+                .protocol(Protocol.HTTP_1_1)
+                .code(if (bytes != null) 200 else 404)
+                .message(if (bytes != null) "OK" else "Not Found")
+                .body((bytes ?: ByteArray(0)).toResponseBody("image/jpeg".toMediaType()))
+                .build()
         }
-        .addInterceptor(TwoCaptcha.createCloudflareInterceptor(::twoCaptchaApiKey))
-        .rateLimit(1, 2.seconds)
-        .build()
-
-    private val captchaRegex = """window\.__captcha\s*=\s*\{\s*needed\s*:\s*true\s*,?""".toRegex()
-
-    companion object {
-        private const val JAPSCAN_CACHE_HOST = "japscan-cache.local"
-        private const val CACHE_FILE_PREFIX = "japscan-"
-
-        private val CHAPTER_PATH_TYPES = setOf("manga", "manhua", "manhwa", "bd", "comic")
-        private val HIDDEN_STYLE_TOKENS = listOf(
-            "display:none",
-            "visibility:hidden",
-            "opacity:0",
-            "width:0",
-            "height:0",
-            "pointer-events:none",
-            "clip-path:inset(100%",
-            "clip-path:circle(0)",
-            "clip:rect(0,0,0,0",
-            "font-size:0",
-            "text-indent:-",
-        )
-
-        // Match styles that visually remove an element while leaving it in the DOM:
-        //  - large absolute offset (3+ digits) via top/bottom/left/right or `inset:` shorthand
-        //  - `transform: translate / translateX / translateY / translated` with a 3+ digit offset
-        //  - `transform: scale(0)` / `scale3d(0,...)` (collapsed to nothing)
-        //  - `transform: matrix(0,0,0,0,...)` (also collapsed)
-        //  - `max-width:0` / `max-height:0` (mirror of the existing width:0/height:0 tokens)
-        // 3 digits is enough to be off-screen even with viewport units (200vh, 999vw, …)
-        // while still tolerating fine adjustments like top:-1px or right:99px.
-        private val OFFSCREEN_OFFSET_REGEX = Regex(
-            """(?:top|bottom|left|right|inset):-?\d{3,}""" +
-                """|transform:translate(?:3d|x|y)?\([^)]*-?\d{3,}""" +
-                """|transform:scale(?:3d)?\(0[,)]""" +
-                """|transform:matrix\(0,0,0,0""" +
-                """|max-(?:width|height):0""",
-        )
-        val dateFormat = SimpleDateFormat("dd MMM yyyy", Locale.US)
-
-        private const val SHOW_SPOILER_CHAPTERS_TITLE = "Les chapitres en Anglais ou non traduit sont upload en tant que \" Spoilers \" sur Japscan"
-        private const val SHOW_SPOILER_CHAPTERS = "JAPSCAN_SPOILER_CHAPTERS"
-        private val prefsEntries = arrayOf("Montrer uniquement les chapitres traduit en Français", "Montrer les chapitres spoiler")
-        private val prefsEntryValues = arrayOf("hide", "show")
-
-        private const val TWOCAPTCHA_API_KEY = "TWOCAPTCHA_API_KEY"
-        private const val TWOCAPTCHA_API_KEY_TITLE = "Clé API 2Captcha (Résolution Cloudflare Turnstile)"
+        rateLimit(1, 2.seconds)
     }
 
-    private fun chapterListPref() = preferences.getString(SHOW_SPOILER_CHAPTERS, "hide")
+    private fun twoCaptchaApiKey(): String = preferences.getString(TWOCAPTCHA_API_KEY, "")?.trim().orEmpty()
 
-    override fun headersBuilder() = super.headersBuilder()
-        .add("referer", "$internalBaseUrl/")
+    // Sometimes an adblock blocker will pop up, preventing the user from opening
+    // a cloudflare protected page
+    override fun getHomeUrl() = "$baseUrl/mangas/?sort=popular&p=1"
 
-    // Popular
-    override fun popularMangaRequest(page: Int): Request = GET("$internalBaseUrl/mangas/?sort=popular&p=$page", headers)
+    override suspend fun getPopularManga(page: Int) = parseMangaList(client.get("$baseUrl/mangas/?sort=popular&p=$page").asJsoup())
 
-    override fun popularMangaParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-        val manga = document.select(".mangas-list .manga-block:not(:has(a[href='']))").map { element ->
+    override suspend fun getLatestUpdates(page: Int) = parseMangaList(client.get("$baseUrl/mangas/?sort=updated&p=$page").asJsoup())
+
+    private fun parseMangaList(document: Document): MangasPage {
+        val mangas = document.select(".mangas-list .manga-block:not(:has(a[href='']))").map { element ->
             SManga.create().apply {
-                element.select("a").first()!!.let {
-                    setUrlWithoutDomain(it.attr("href"))
+                element.selectFirst("a")!!.let {
+                    setUrlWithoutDomain(it.absUrl("href"))
                     title = it.text()
-                    thumbnail_url = it.selectFirst("img")?.attr("abs:data-src")
+                    thumbnail_url = it.selectFirst("img")?.absUrl("data-src")
                 }
             }
         }
         val hasNextPage = document.selectFirst(".pagination > li:last-child:not(.disabled)") != null
-        return MangasPage(manga, hasNextPage)
+        return MangasPage(mangas, hasNextPage)
     }
 
-    // Latest
-    override fun latestUpdatesRequest(page: Int): Request = GET("$internalBaseUrl/mangas/?sort=updated&p=$page", headers)
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        if (query.isBlank()) return getPopularManga(page)
+        val body = FormBody.Builder().add("search", query).build()
+        val searchHeaders = headers.newBuilder().add("X-Requested-With", "XMLHttpRequest").build()
+        val results = client.post("$baseUrl/ls/", searchHeaders, body).parseAs<List<SearchResultDto>>()
+        return MangasPage(results.map { it.toSManga(baseUrl) }, false)
+    }
 
-    override fun latestUpdatesParse(response: Response) = popularMangaParse(response)
-
-    // Search
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        if (query.isEmpty()) {
-            val url = internalBaseUrl.toHttpUrl().newBuilder().apply {
-                addPathSegment("mangas")
-
-                filters.forEach { filter ->
-                    when (filter) {
-                        is TextField -> addPathSegment(((page - 1) + filter.state.toInt()).toString())
-                        is PageList -> addPathSegment(((page - 1) + filter.values[filter.state]).toString())
-                        else -> {}
-                    }
-                }
-            }.build()
-
-            return GET(url, headers)
-        } else {
-            val formBody = FormBody.Builder()
-                .add("search", query)
-                .build()
-            val searchHeaders = headers.newBuilder()
-                .add("X-Requested-With", "XMLHttpRequest")
-                .build()
-
-            return POST("$internalBaseUrl/ls/", searchHeaders, formBody)
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host != baseUrl.toHttpUrl().host) return null
+        val segments = url.pathSegments.filter(String::isNotEmpty)
+        if (segments.size < 2 || segments[0] !in CHAPTER_PATH_TYPES) return null
+        val mangaUrl = "/${segments[0]}/${segments[1]}/"
+        val document = client.get(baseUrl + mangaUrl).asJsoup()
+        return parseMangaDetails(document).apply {
+            this.url = mangaUrl
+            title = document.selectFirst("#main .card-body h1")!!.text()
         }
     }
 
-    override fun searchMangaParse(response: Response): MangasPage {
-        if (response.request.url.pathSegments.first() == "ls") {
-            val jsonResult = response.parseAs<JsonArray>()
-
-            val mangaList = jsonResult.map { jsonEl -> searchMangaFromJson(jsonEl.jsonObject) }
-
-            return MangasPage(mangaList, hasNextPage = false)
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val response = client.get(baseUrl + manga.url)
+        val mangaSlug = extractMangaSlug(response.request.url)
+        val document = response.asJsoup()
+        val details = parseMangaDetails(document).apply {
+            url = manga.url
+            title = manga.title
         }
-
-        val baseUrlHost = internalBaseUrl.toHttpUrl().host
-        val document = response.asJsoup()
-        val manga = document
-            .select("div.card div.p-2")
-            .filter {
-                // Filter out ads masquerading as search results
-                it.select("p a").attr("abs:href").toHttpUrl().host == baseUrlHost
-            }
-            .map { element ->
-                SManga.create().apply {
-                    thumbnail_url = element.select("img").attr("abs:src")
-                    element.select("p a").let {
-                        title = it.text()
-                        url = it.attr("href")
-                    }
-                }
-            }
-        val hasNextPage = document.selectFirst(".mangas-list .manga-block:not(:has(a[href='']))") != null
-
-        return MangasPage(manga, hasNextPage)
+        val chapterList = document.select(chapterListSelector()).mapNotNull { el ->
+            runCatching { parseChapter(el, mangaSlug) }.getOrNull()
+        }
+        return SMangaUpdate(details, filterOutlierChapters(chapterList))
     }
 
-    private fun searchMangaFromJson(jsonObj: JsonObject): SManga = SManga.create().apply {
-        url = jsonObj["url"]!!.string
-        title = jsonObj["name"]!!.string
-        thumbnail_url = internalBaseUrl + jsonObj["image"]!!.string
-    }
-
-    override fun mangaDetailsRequest(manga: SManga): Request = GET(internalBaseUrl + manga.url, headers)
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
+    private fun parseMangaDetails(document: Document) = SManga.create().apply {
         val infoElement = document.selectFirst("#main .card-body")!!
-        val manga = SManga.create()
-
-        manga.thumbnail_url = infoElement.selectFirst("img")?.attr("abs:src")
-
-        val infoRows = infoElement.select(".row, .d-flex")
-        infoRows.select("p").forEach { el ->
-            when (el.select("span").text().trim()) {
-                "Auteur(s):" -> manga.author = el.text().replace("Auteur(s):", "").trim()
-
-                "Artiste(s):" -> manga.artist = el.text().replace("Artiste(s):", "").trim()
-
-                "Genre(s):" -> manga.genre = el.text().replace("Genre(s):", "").trim()
-
-                "Statut:" -> manga.status = el.text().replace("Statut:", "").trim().let {
-                    parseStatus(it)
-                }
+        thumbnail_url = infoElement.selectFirst("img")?.absUrl("src")
+        infoElement.select(".row, .d-flex").select("p").forEach { el ->
+            when (el.select("span").text()) {
+                "Auteur(s):" -> author = el.text().removePrefix("Auteur(s):").trim()
+                "Artiste(s):" -> artist = el.text().removePrefix("Artiste(s):").trim()
+                "Genre(s):" -> genre = el.text().removePrefix("Genre(s):").trim()
+                "Statut:" -> status = parseStatus(el.text().removePrefix("Statut:"))
             }
         }
-        manga.description = infoElement.selectFirst("div:contains(Synopsis) + p")?.ownText().orEmpty()
-
-        return manga
+        description = infoElement.selectFirst("div:contains(Synopsis) + p")?.ownText()
     }
 
     private fun parseStatus(status: String) = status.lowercase().let {
@@ -267,57 +177,30 @@ abstract class Japscan :
         }
     }
 
-    override fun getChapterUrl(chapter: SChapter): String = internalBaseUrl + chapter.url
-
-    override fun chapterListRequest(manga: SManga): Request = GET(internalBaseUrl + manga.url, headers)
-
+    // JapScan sometimes uploads some "spoiler preview" chapters, containing 2 or 3 untranslated pictures taken from a raw. Sometimes they also upload full RAWs/US versions and replace them with a translation as soon as available.
+    // Those have a span.badge "SPOILER" or "RAW". The additional pseudo selector makes sure to exclude these from the chapter list.
     private fun chapterListSelector() = "#list_chapters > div.collapse > div.list_chapters" +
-        if (chapterListPref() == "hide") {
+        if (preferences.getString(SHOW_SPOILER_CHAPTERS, "hide") == "hide") {
             ":not(:has(.badge:contains(SPOILER),.badge:contains(RAW),.badge:contains(VUS)))"
         } else {
             ""
         }
-    // JapScan sometimes uploads some "spoiler preview" chapters, containing 2 or 3 untranslated pictures taken from a raw. Sometimes they also upload full RAWs/US versions and replace them with a translation as soon as available.
-    // Those have a span.badge "SPOILER" or "RAW". The additional pseudo selector makes sure to exclude these from the chapter list.
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val document = response.asJsoup()
-        val mangaSlug = extractMangaSlug(response.request.url)
-        val chapters = document.select(chapterListSelector()).mapNotNull { el ->
-            runCatching { parseChapter(el, mangaSlug) }.getOrNull()
-        }
-        return filterOutlierChapters(chapters)
-    }
-
-    // Defense in depth: if a honeypot ever slips past the per-row hidden-style
-    // heuristics, its URL number is wildly out of range (e.g. 483181 vs. real 1181).
-    // Drop the upper cluster when consecutive chapter numbers jump by more than 1000.
+    // Backstop for a honeypot that clears the slug/number binding in parseChapter: its number
+    // comes out wildly out of range (observed: 483181 among real 1174..1181), so cap on the median.
+    // Compare chapter_number, not the URL id: "Chapitre 1100.5" is /11005/.
     private fun filterOutlierChapters(chapters: List<SChapter>): List<SChapter> {
-        val withNum = chapters.mapNotNull { ch ->
-            val n = ch.url.trimEnd('/').substringAfterLast('/').toLongOrNull() ?: return@mapNotNull null
-            ch to n
-        }
-        if (withNum.size < 2) return chapters
-        val sorted = withNum.sortedBy { it.second }
-        var gapIdx = -1
-        var gapSize = 0L
-        for (i in 1 until sorted.size) {
-            val g = sorted[i].second - sorted[i - 1].second
-            if (g > gapSize) {
-                gapSize = g
-                gapIdx = i
-            }
-        }
-        if (gapSize <= 1000) return chapters
-        val keep = sorted.take(gapIdx).map { it.first }.toSet()
-        return chapters.filter { it in keep }
+        val nums = chapters.map { it.chapter_number }.filter { it >= 0f }.sorted()
+        if (nums.size < 3) return chapters
+        val ceiling = nums[nums.size / 2] * 10 + 100
+        return chapters.filter { it.chapter_number <= ceiling }
     }
 
-    private fun extractMangaSlug(url: okhttp3.HttpUrl): String? {
+    private fun extractMangaSlug(url: HttpUrl): String? {
         val segments = url.pathSegments.filter { it.isNotEmpty() }
         val typeIdx = segments.indexOfFirst { it in CHAPTER_PATH_TYPES }
         if (typeIdx == -1 || typeIdx + 1 >= segments.size) return null
-        return segments[typeIdx + 1].takeIf { it.isNotEmpty() }
+        return segments[typeIdx + 1]
     }
 
     private fun isHidden(el: Element): Boolean {
@@ -325,9 +208,7 @@ abstract class Japscan :
         if (el.hasAttr("hidden")) return true
         if (el.attr("aria-hidden").equals("true", ignoreCase = true)) return true
         val style = el.attr("style").replace(" ", "").lowercase()
-        if (HIDDEN_STYLE_TOKENS.any { style.contains(it) }) return true
-        if (OFFSCREEN_OFFSET_REGEX.containsMatchIn(style)) return true
-        return false
+        return HIDDEN_STYLE_TOKENS.any { style.contains(it) } || HIDDEN_STYLE_REGEX.containsMatchIn(style)
     }
 
     private fun isHiddenWithin(el: Element, root: Element): Boolean {
@@ -339,104 +220,144 @@ abstract class Japscan :
         return false
     }
 
+    // Japscan hides honeypot links in each row (d-none, zero size, off-screen, ...) and puts the
+    // real URL in a random non-href attribute. Only visible elements are considered, and the URL
+    // must be /<type>/<mangaSlug>/<N>/ with N matching the chapter number in the name.
     private fun parseChapter(element: Element, mangaSlug: String?): SChapter {
-        // Only search for a tag with any attribute containing manga/manhua/manhwa.
-        // Skip elements that are visually hidden — Japscan hides honeypots with
-        // class="d-none", inline display/visibility/opacity:0, zero size, or by
-        // positioning them way off-screen. The visible chapter row never carries
-        // any of these, so to evade detection Japscan would have to make the
-        // honeypots visible to humans too.
         val allUrlPairs = (element.getElementsContainingText("Chapitre") + element.getElementsContainingText("Volume"))
             .filterNot { isHiddenWithin(it, element) }
             .mapNotNull { el ->
-                // Find the first attribute whose value matches the chapter URL pattern
                 val attrMatch = el.attributes().asList().firstOrNull { attr ->
-                    val value = attr.value
-                    value.startsWith("/manga/") || value.startsWith("/manhua/") || value.startsWith("/manhwa/") || value.startsWith("/bd/") || value.startsWith("/comic/")
+                    CHAPTER_PATH_TYPES.any { attr.value.startsWith("/$it/") }
                 }
-                if (attrMatch != null) {
-                    val name = el.ownText().ifBlank { el.text() }
-                    // Mark if the attribute is not "href"
-                    val isNonHref = attrMatch.key != "href"
-                    Triple(name, attrMatch.value, isNonHref)
-                } else {
-                    null
-                }
+                attrMatch?.let { Pair(el.ownText().ifBlank { el.text() }, it.value) }
             }
             .distinctBy { it.second }
 
-        // Filter out anti-scraping honeypots by binding name, slug and URL number together:
-        // a real chapter URL is /<type>/<mangaSlug>/<chapterNum>/, with the same slug as the
-        // manga page and a chapter number that appears in the chapter's name ("Chapitre N: ...").
-        // Stripping non-digits from the name handles half-chapters like "Chapitre 1100.5" + /11005/.
-        // Honeypots use a different slug (e.g. /manga/cv/N/) with sequential numbers that match a
-        // fake "Chapitre N" label, so name/number alone is not enough — slug check is what stops them.
-        val filtered = allUrlPairs
-            .filter { (name, url, _) ->
-                val segments = url.split('/').filter { it.isNotEmpty() }
-                if (segments.size != 3) return@filter false
-                if (segments[0] !in CHAPTER_PATH_TYPES) return@filter false
-                if (mangaSlug != null && segments[1] != mangaSlug) return@filter false
-                val urlNum = url.trimEnd('/').substringAfterLast('/')
-                if (!urlNum.all { it.isDigit() }) return@filter false
-                if (urlNum.length > 1 && urlNum.startsWith('0')) return@filter false
-                val chapterNum = Regex("""(?i)chapitre\s+([\d.]+)""").find(name)
-                    ?.groupValues?.get(1)?.replace(".", "")
-                    ?: name.split(Regex("[^0-9.]+")).lastOrNull { it.isNotEmpty() }?.replace(".", "")
-                    ?: return@filter false
-                chapterNum == urlNum
-            }
+        val filtered = allUrlPairs.filter { (name, url) ->
+            val segments = url.split('/').filter { it.isNotEmpty() }
+            if (segments.size != 3) return@filter false
+            if (segments[0] !in CHAPTER_PATH_TYPES) return@filter false
+            if (mangaSlug != null && segments[1] != mangaSlug) return@filter false
+            val urlNum = segments[2]
+            if (!urlNum.all { it.isDigit() }) return@filter false
+            if (urlNum.length > 1 && urlNum.startsWith('0')) return@filter false
+            val chapterNum = CHAPTER_NUM_REGEX.find(name)?.groupValues?.get(1)?.replace(".", "")
+                ?: name.split(NON_NUMBER_REGEX).lastOrNull { it.isNotEmpty() }?.replace(".", "")
+                ?: return@filter false
+            chapterNum == urlNum
+        }
 
-        // Fall back to the unfiltered list in case the heuristics are too aggressive.
-        // Defense in depth: when the slug filter is unavailable, prefer the longest URL — real
-        // slugs (e.g. "one-piece") are usually longer than honeypot slugs (e.g. "cv").
-        val urlPairs = (filtered.ifEmpty { allUrlPairs })
-            .sortedWith(
-                compareByDescending<Triple<String, String, Boolean>> { it.third }
-                    .thenByDescending { it.second.length },
-            ) // Prefer non-href first, then longer URLs
-            .map { Pair(it.first, it.second) }
-
-        val foundPair = urlPairs.firstOrNull()
+        // Fall back to the unfiltered list in case the heuristics are too aggressive, preferring
+        // the longest URL: real slugs are usually longer than honeypot slugs (e.g. "cv").
+        val (name, url) = filtered.firstOrNull()
+            ?: allUrlPairs.maxByOrNull { it.second.length }
             ?: throw Exception("Impossible de trouver l'URL du chapitre")
 
-        val chapter = SChapter.create()
-        chapter.setUrlWithoutDomain(foundPair.second)
-        chapter.name = foundPair.first
-        chapter.date_upload = element.selectFirst("span")?.text()?.let { parseChapterDate(it) } ?: 0L
-        return chapter
+        return SChapter.create().apply {
+            this.url = url
+            this.name = name
+            chapter_number = CHAPTER_NUM_REGEX.find(name)?.groupValues?.get(1)?.toFloatOrNull() ?: -1f
+            date_upload = DATE_FORMAT.tryParseDate(element.selectFirst("span.float-right")?.text(), PARIS)
+        }
     }
 
-    private fun parseChapterDate(date: String) = dateFormat.tryParse(date)
-
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.fromCallable {
-        val interfaceName = randomString()
-        val context = Injekt.get<Application>()
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        // Must be read before the first suspension point, while the caller's frames are on the stack.
         val isReader = Exception().stackTrace.any { it.className.contains("reader") }
-
-        val handler = Handler(Looper.getMainLooper())
-        val latch = CountDownLatch(1)
+        val context = applicationContext
+        val chapterUrl = baseUrl + chapter.url
         sweepPageCache(context.cacheDir)
-        var webView: WebView? = null
-        var request: Response = client.newCall(GET("$internalBaseUrl${chapter.url}", headers)).execute()
-        var pageContent = request.body.string()
 
-        Log.d("JapscanDebug", "fetchPageList for ${chapter.url} - page length: ${pageContent.length}")
+        solveCaptcha(chapterUrl, isReader)
 
-        // Attempt automatic challenge solving
-        val stripsArrayRegex = """(?:strips|"[a-f0-9]{6}")\s*:\s*(\[[^\]]*\])""".toRegex()
-        val elementRegex = """\{\s*"uuid"\s*:\s*"([^"]+)"\s*,\s*"src"\s*:\s*"([^"]*)"\s*\}""".toRegex()
-        val tokenRegex = """(?:token|"[a-f0-9]{6}")\s*:\s*"([0-9a-fA-F]{64})"""".toRegex()
+        // manhwa/manhua use the long-strip reader, everything else the paginated one. The DOM
+        // can't tell them apart before the reader JS mounts, and both need different hooks.
+        val urlSegment = chapter.url.trimStart('/').substringBefore('/').lowercase()
+        val isWebtoon = urlSegment == "manhwa" || urlSegment == "manhua"
+        val interfaceName = randomString()
+        val jsInterface = JsInterface(context.cacheDir)
+        val userAgent = headers["User-Agent"]
 
+        val webView = withContext(Dispatchers.Main) {
+            createReaderWebView(chapterUrl, isWebtoon, urlSegment, interfaceName, jsInterface, userAgent)
+        }
+        try {
+            // A healthy long chapter can take minutes, but a wedged driver shouldn't burn the
+            // whole budget: give up when no page was saved for IDLE_TIMEOUT.
+            val deadline = TimeSource.Monotonic.markNow() + 3.minutes
+            while (!jsInterface.done.isCompleted && deadline.hasNotPassedNow()) {
+                withTimeoutOrNull(IDLE_TIMEOUT) { jsInterface.activity.receive() } ?: break
+            }
+        } finally {
+            withContext(NonCancellable + Dispatchers.Main) { webView.destroy() }
+        }
+
+        if (!jsInterface.done.isCompleted) {
+            throw Exception("Erreur lors de la récupération des pages")
+        }
+        return jsInterface.snapshot().mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
+    }
+
+    private suspend fun captchaPresent(chapterUrl: String): Boolean = client.get(chapterUrl, CacheControl.FORCE_NETWORK).use {
+        CAPTCHA_REGEX.containsMatchIn(it.body.string())
+    }
+
+    private suspend fun solveCaptcha(chapterUrl: String, isReader: Boolean) {
+        if (!captchaPresent(chapterUrl)) return
+
+        // Cold sessions usually get past the captcha after loading the homepage once in a WebView
+        warmupWebViewSession()
+        if (!captchaPresent(chapterUrl)) return
+
+        // Attempt automatic custom Japscan challenge solving first
+        if (trySolveCustomChallenge(chapterUrl)) return
+
+        val context = applicationContext
+        try {
+            val intent = Intent().apply {
+                component = ComponentName(context, "eu.kanade.tachiyomi.ui.webview.WebViewActivity")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                putExtra("url_key", chapterUrl)
+                putExtra("source_key", id)
+                putExtra("title_key", "Résolvez le captcha, fermez la Webview et réouvrez le chapitre.")
+            }
+            context.startActivity(intent)
+        } catch (_: Exception) {
+            // Suwayomi etc.
+            throw Exception("Résolvez le captcha de ce chapitre depuis la WebView et réouvrez le chapitre.")
+        }
+        repeat(CAPTCHA_MAX_POLLS) {
+            delay(CAPTCHA_POLL_INTERVAL)
+            if (!captchaPresent(chapterUrl)) {
+                val closeIntent = Intent().apply {
+                    val targetClass = if (isReader) {
+                        "eu.kanade.tachiyomi.ui.reader.ReaderActivity"
+                    } else {
+                        "eu.kanade.tachiyomi.ui.main.MainActivity"
+                    }
+                    component = ComponentName(context, targetClass)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                }
+                context.startActivity(closeIntent)
+                return
+            }
+        }
+        throw Exception("Résolvez le captcha, fermez la Webview et réouvrez le chapitre.")
+    }
+
+    private suspend fun trySolveCustomChallenge(chapterUrl: String): Boolean {
         var autoCaptchaTry = 0
+        var pageContent = client.get(chapterUrl, CacheControl.FORCE_NETWORK).use { it.body.string() }
+
         while (autoCaptchaTry < 3) {
-            val stripsMatch = stripsArrayRegex.find(pageContent)
+            val stripsMatch = STRIPS_ARRAY_REGEX.find(pageContent)
             val stripsContent = stripsMatch?.groupValues?.get(1).orEmpty()
-            val tokenMatch = tokenRegex.find(pageContent)
+            val tokenMatch = TOKEN_REGEX.find(pageContent)
 
             if (stripsContent.isNotEmpty() && tokenMatch != null) {
                 Log.d("JapscanDebug", "Captcha detected on try #$autoCaptchaTry - token found")
-                val items = elementRegex.findAll(stripsContent).map {
+                val items = ELEMENT_REGEX.findAll(stripsContent).map {
                     val uuid = it.groupValues[1]
                     val src = it.groupValues[2]
                     uuid to src
@@ -453,33 +374,29 @@ abstract class Japscan :
                             .addFormDataPart("answer", answer.toJsonString())
                             .build()
 
-                        val captchaRequest = client.newCall(
-                            POST(
-                                "$internalBaseUrl/validate-captcha/",
-                                headers = headers.newBuilder()
-                                    .add("Referer", "$internalBaseUrl${chapter.url}")
-                                    .build(),
-                                body = multipartBody,
-                            ),
-                        ).execute()
-                        val captchaResponseBody = captchaRequest.body.string()
-                        Log.d("JapscanDebug", "Captcha response: $captchaResponseBody")
-                        captchaResponseBody.contains(""""success":\s*true""".toRegex())
+                        val captchaRequest = Request.Builder()
+                            .url("$baseUrl/validate-captcha/")
+                            .header("Referer", chapterUrl)
+                            .post(multipartBody)
+                            .build()
+
+                        client.newCall(captchaRequest).execute().use { resp ->
+                            val body = resp.body.string()
+                            Log.d("JapscanDebug", "Captcha response: $body")
+                            body.contains(""""success":\s*true""".toRegex())
+                        }
                     }.getOrDefault(false)
 
                     if (solved) {
-                        Log.d("JapscanDebug", "Captcha solved successfully! Reloading page...")
-                        request = client.newCall(GET("$internalBaseUrl${chapter.url}", headers)).execute()
-                        pageContent = request.body.string()
-                        if (!pageContent.contains(captchaRegex)) {
-                            Log.d("JapscanDebug", "Captcha cleared after reload!")
-                            break
+                        Log.d("JapscanDebug", "Captcha solved successfully! Verifying...")
+                        pageContent = client.get(chapterUrl, CacheControl.FORCE_NETWORK).use { it.body.string() }
+                        if (!CAPTCHA_REGEX.containsMatchIn(pageContent)) {
+                            Log.d("JapscanDebug", "Captcha cleared after solve!")
+                            return true
                         }
                     } else {
-                        Log.d("JapscanDebug", "Captcha solving attempt #$autoCaptchaTry failed. Re-fetching chapter to get a new captcha...")
-                        // Re-fetch chapter page so the next try operates on a brand new challenge image
-                        request = client.newCall(GET("$internalBaseUrl${chapter.url}", headers)).execute()
-                        pageContent = request.body.string()
+                        Log.d("JapscanDebug", "Captcha solving attempt #$autoCaptchaTry failed. Re-fetching chapter...")
+                        pageContent = client.get(chapterUrl, CacheControl.FORCE_NETWORK).use { it.body.string() }
                     }
                 } else {
                     Log.d("JapscanDebug", "Captcha items count is not 4: ${items.size}")
@@ -490,445 +407,86 @@ abstract class Japscan :
                 break
             }
         }
+        return !CAPTCHA_REGEX.containsMatchIn(pageContent)
+    }
 
-        val matchResult = captchaRegex.find(pageContent)
-        Log.d("JapscanDebug", "captchaRegex match: ${matchResult != null}")
-        if (matchResult != null) {
-            val idx = pageContent.indexOf("window.__captcha")
-            if (idx != -1) {
-                val snippet = pageContent.substring(idx, minOf(pageContent.length, idx + 1000))
-                Log.d("JapscanDebug", "Captcha snippet: $snippet")
+    private suspend fun warmupWebViewSession() {
+        runCatching {
+            runWebView<Unit>(timeout = 8.seconds) {
+                var finished = false
+                onPageFinished { finished = true }
+                // Settle window that lets Cloudflare's beacon commit cf_clearance before teardown
+                poll(200.milliseconds) { if (finished) resolve(Unit) }
+                loadUrl("$baseUrl/")
             }
         }
+    }
 
-        if (matchResult != null) {
-            try {
-                val intent = Intent().apply {
-                    component = ComponentName(context, "eu.kanade.tachiyomi.ui.webview.WebViewActivity")
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    putExtra("url_key", "$internalBaseUrl${chapter.url}")
-                    putExtra("source_key", id)
-                    putExtra("title_key", "Résolvez le captcha, fermez la Webview et réouvrez le chapitre.")
-                }
-
-                context.startActivity(intent)
-            } catch (_: Exception) {
-                // Suwayomi etc.
-                throw Exception("Résolvez le captcha de ce chapitre depuis la WebView et réouvrez le chapitre.")
-            }
-            var captchaWait = 0
-            while (captchaWait < 15) {
-                Thread.sleep(5000)
-                request = client.newCall(GET("$internalBaseUrl${chapter.url}", headers)).execute()
-                pageContent = request.body.string()
-                val isGood = captchaRegex.find(pageContent)
-                if (isGood == null) {
-                    val closeIntent = Intent().apply {
-                        val targetClass = if (isReader) {
-                            "eu.kanade.tachiyomi.ui.reader.ReaderActivity"
-                        } else {
-                            "eu.kanade.tachiyomi.ui.main.MainActivity"
-                        }
-                        component = ComponentName(context, targetClass)
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                    }
-                    context.startActivity(closeIntent)
-                    break
-                } else {
-                    captchaWait++
-                }
-            }
-            if (captchaWait >= 15) {
-                throw Exception("Résolvez le captcha, fermez la Webview et réouvrez le chapitre.")
-            }
-        }
-
-        val urlSegment = chapter.url.trimStart('/').substringBefore('/').lowercase()
-        val isWebtoon = urlSegment == "manhwa" || urlSegment == "manhua"
-        val jsInterface = JsInterface(latch, context.cacheDir, handler) { webView }
-
-        handler.post {
-            // Synchronize cookies from OkHttp client to Android WebView CookieManager
-            val cookieManager = CookieManager.getInstance()
-            cookieManager.setAcceptCookie(true)
-            val httpUrl = "$internalBaseUrl${chapter.url}".toHttpUrl()
-            val okHttpCookies = client.cookieJar.loadForRequest(httpUrl)
-            for (cookie in okHttpCookies) {
-                cookieManager.setCookie(internalBaseUrl, "${cookie.name}=${cookie.value}; path=/; domain=${httpUrl.host}")
-            }
-            cookieManager.flush()
-
-            val innerWv = WebView(context)
-            webView = innerWv
-            cookieManager.setAcceptThirdPartyCookies(innerWv, true)
-
-            innerWv.settings.domStorageEnabled = true
-            innerWv.settings.javaScriptEnabled = true
-            innerWv.settings.blockNetworkImage = false
-            innerWv.settings.userAgentString = headers["User-Agent"]
-            innerWv.addJavascriptInterface(jsInterface, interfaceName)
-
-            innerWv.webChromeClient = object : WebChromeClient() {
-                override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                    Log.d("JapscanDebug", "[Console] ${consoleMessage?.message()} -- line ${consoleMessage?.lineNumber()}")
-                    return true
-                }
-            }
-
-            innerWv.webViewClient = object : WebViewClient() {
-                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                    super.onPageStarted(view, url, favicon)
-                    Log.d("JapscanDebug", "WebView onPageStarted: $url")
-
-                    // Satisfy anti-adblock check
-                    view?.evaluateJavascript(
-                        """
-                            (function(){
-                                if (window.aclib) return;
-                                window.aclib = {
-                                    runPop: function runPop(){},
-                                    runBanner: function runBanner(){},
-                                    runNative: function runNative(){},
-                                    runInPagePush: function runInPagePush(){},
-                                    isShowingPop: false,
-                                };
-                            })();
-                        """.trimIndent(),
-                        null,
-                    )
-
-                    // Cloudflare Turnstile interceptor (2Captcha)
-                    view?.evaluateJavascript(
-                        TwoCaptcha.turnstileInterceptorScript(interfaceName),
-                        null,
-                    )
-
-                    // Blob queue hook: captures each decrypted image blob exactly once
-                    view?.evaluateJavascript(
-                        """
-                            (function(){
-                                if (window.__japscanHooked) return;
-                                window.__japscanHooked = true;
-                                window.__japscanBlobQueue = [];
-                                var _seenBlobs = new WeakSet();
-                                var _seenSignatures = new Set();
-                                var _orig = URL.createObjectURL.bind(URL);
-                                URL.createObjectURL = function(obj){
-                                    var u = _orig(obj);
-                                    try {
-                                        if (obj && obj.type && /^image\//.test(obj.type)) {
-                                            if (!_seenBlobs.has(obj)) {
-                                                _seenBlobs.add(obj);
-                                                // Check size-based fingerprint asynchronously
-                                                (async function(){
-                                                    try {
-                                                        var sigKey = obj.size + '_' + obj.type;
-                                                        var slice = obj.slice(0, 64);
-                                                        var buf = await slice.arrayBuffer();
-                                                        var view = new Uint8Array(buf);
-                                                        var sample = '';
-                                                        for (var i = 0; i < view.length; i++) sample += view[i].toString(16);
-                                                        var fullSig = sigKey + '_' + sample;
-                                                        if (_seenSignatures.has(fullSig)) {
-                                                            return;
-                                                        }
-                                                        _seenSignatures.add(fullSig);
-                                                        window.__japscanBlobQueue.push(u);
-                                                        window.dispatchEvent(new CustomEvent('japscan:blob'));
-                                                    } catch(e) {
-                                                        window.__japscanBlobQueue.push(u);
-                                                        window.dispatchEvent(new CustomEvent('japscan:blob'));
-                                                    }
-                                                })();
-                                            }
-                                        }
-                                    } catch(e) {}
-                                    return u;
-                                };
-                                try {
-                                    URL.createObjectURL.toString = function(){
-                                        return 'function createObjectURL() { [native code] }';
-                                    };
-                                } catch(e) {}
-                            })();
-                        """.trimIndent(),
-                        null,
-                    )
-                }
-
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    super.onPageFinished(view, url)
-                    Log.d("JapscanDebug", "WebView onPageFinished: $url")
-                    view?.onResume()
-                    view?.resumeTimers()
-
-                    // Driver: drains __japscanBlobQueue and navigates/scrolls to ensure all pages render
-                    view?.evaluateJavascript(
-                        """
-                            (async function(){
-                                if (window.__japscanDriverStarted) return;
-                                window.__japscanDriverStarted = true;
-                                var sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
-
-                                function waitForElement(predicate, timeoutMs) {
-                                    return new Promise(function(resolve) {
-                                        var existing = predicate();
-                                        if (existing) { resolve(existing); return; }
-                                        var timer = setTimeout(function() {
-                                            if (observer) observer.disconnect();
-                                            resolve(null);
-                                        }, timeoutMs || 10000);
-                                        var observer = new MutationObserver(function() {
-                                            var found = predicate();
-                                            if (found) {
-                                                clearTimeout(timer);
-                                                observer.disconnect();
-                                                resolve(found);
-                                            }
-                                        });
-                                        observer.observe(document.documentElement, { childList: true, subtree: true });
-                                    });
-                                }
-
-                                function waitForBlobEvent(timeoutMs) {
-                                    return new Promise(function(resolve) {
-                                        if (window.__japscanBlobQueue && window.__japscanBlobQueue.length > 0) {
-                                            resolve(true);
-                                            return;
-                                        }
-                                        var timer = setTimeout(function() {
-                                            window.removeEventListener('japscan:blob', onBlob);
-                                            resolve(false);
-                                        }, timeoutMs || 6000);
-                                        function onBlob() {
-                                            clearTimeout(timer);
-                                            window.removeEventListener('japscan:blob', onBlob);
-                                            resolve(true);
-                                        }
-                                        window.addEventListener('japscan:blob', onBlob);
-                                    });
-                                }
-
-                                async function saveBlobUrl(u){
-                                    if (!u) return false;
-                                    try {
-                                        var r = await fetch(u);
-                                        var b = await r.blob();
-                                        var d = await new Promise(function(res, rej){
-                                            var fr = new FileReader();
-                                            fr.onload = function(){ res(fr.result); };
-                                            fr.onerror = rej;
-                                            fr.readAsDataURL(b);
-                                        });
-                                        if (typeof d === 'string' && d.indexOf('data:image/') === 0) {
-                                            window.$interfaceName.savePage(d);
-                                            return true;
-                                        }
-                                    } catch(e) {
-                                        console.log('[japscan] saveBlobUrl failed: ' + e);
-                                    } finally {
-                                        try { URL.revokeObjectURL(u); } catch(e) {}
-                                    }
-                                    return false;
-                                }
-
-                                async function drainQueue(){
-                                    var count = 0;
-                                    while (window.__japscanBlobQueue && window.__japscanBlobQueue.length > 0) {
-                                        var u = window.__japscanBlobQueue.shift();
-                                        var ok = await saveBlobUrl(u);
-                                        if (ok) count++;
-                                    }
-                                    return count;
-                                }
-
-                                var isWebtoon = $isWebtoon;
-                                window.$interfaceName.log('driver started, isWebtoon=' + isWebtoon + ', url=' + window.location.href + ', title=' + document.title);
-
-                                if (isWebtoon) {
-                                    var fullReader = await waitForElement(function() {
-                                        var el = document.getElementById('full-reader');
-                                        return (el && el.children.length > 0) ? el : null;
-                                    }, 10000);
-
-                                    var items = fullReader ? Array.from(fullReader.children) : [];
-                                    var total = items.length;
-                                    window.$interfaceName.log('webtoon mode, items=' + total);
-                                    if (total === 0) {
-                                        window.__japscanDriverStarted = false;
-                                        return;
-                                    }
-
-                                    var savedSoFar = 0;
-                                    function getSavedCount() {
-                                        try { return window.$interfaceName.getSavedCount(); } catch(e) { return savedSoFar; }
-                                    }
-
-                                    // Trigger lazy rendering by scrolling down through all items
-                                    for (var i = 0; i < items.length; i++) {
-                                        try {
-                                            items[i].scrollIntoView({ block: 'center', behavior: 'instant' });
-                                        } catch(e) {}
-                                        var drained = await drainQueue();
-                                        savedSoFar += drained;
-                                        if (getSavedCount() >= total) break;
-                                        await sleep(200);
-                                    }
-
-                                    // Wait for any remaining items to finish processing
-                                    var idleRounds = 0;
-                                    while (idleRounds < 6 && getSavedCount() < total) {
-                                        var newSaved = await drainQueue();
-                                        if (newSaved > 0) {
-                                            savedSoFar += newSaved;
-                                            idleRounds = 0;
-                                        } else {
-                                            idleRounds++;
-                                        }
-                                        await sleep(400);
-                                    }
-
-                                    console.log('[japscan] webtoon done, saved=' + getSavedCount());
-                                    try { window.$interfaceName.passDone(); } catch(e) {}
-                                    return;
-                                }
-
-                                // Paginated mode for standard mangas: event-driven DOM readiness
-                                var sel = await waitForElement(function() {
-                                    var s = document.getElementById('pages');
-                                    return (s && s.options.length > 1) ? s : null;
-                                }, 10000);
-
-                                if (!sel) {
-                                    window.$interfaceName.log('Timeout waiting for #pages (DOM blocked or not ready)');
-                                    window.__japscanDriverStarted = false;
-                                    return;
-                                }
-
-                                var total = sel.options.length;
-                                var nextBtn = document.getElementById('block-right');
-                                window.$interfaceName.log('event-driven paginated mode started, total = ' + total);
-
-                                function navNext(){
-                                    try {
-                                        if (nextBtn) { nextBtn.click(); return; }
-                                        document.dispatchEvent(new KeyboardEvent('keydown', {
-                                            key: 'ArrowRight', code: 'ArrowRight', which: 39, keyCode: 39, bubbles: true
-                                        }));
-                                    } catch(e) {}
-                                }
-
-                                function getSavedCount() {
-                                    try { return window.$interfaceName.getSavedCount(); } catch(e) { return 0; }
-                                }
-
-                                // Background consumer: saves blobs as fast as they arrive
-                                var consumerActive = true;
-                                var consumerPromise = (async function(){
-                                    while (consumerActive || (window.__japscanBlobQueue && window.__japscanBlobQueue.length > 0)) {
-                                        await drainQueue();
-                                        if (getSavedCount() >= total) break;
-                                        await sleep(20);
-                                    }
-                                })();
-
-                                // Event-driven producer: advances immediately upon blob event
-                                for (var i = 0; i < total; i++) {
-                                    if (window.__japscanBlobQueue.length === 0 && getSavedCount() <= i) {
-                                        await waitForBlobEvent(200);
-                                    }
-                                    if (i < total - 1 && getSavedCount() < total) {
-                                        navNext();
-                                    }
-                                }
-
-                                // Final drain & check
-                                var idle = 0;
-                                while (idle < 8 && getSavedCount() < total) {
-                                    var before = getSavedCount();
-                                    await sleep(200);
-                                    if (getSavedCount() > before) idle = 0; else idle++;
-                                }
-                                consumerActive = false;
-                                await consumerPromise;
-                                await drainQueue();
-
-                                window.$interfaceName.log('event-driven paginated mode done, saved = ' + getSavedCount());
-                                try { window.$interfaceName.passDone(); } catch(e) {}
-                            })();
-                        """.trimIndent(),
-                        null,
-                    )
-                }
-            }
-
-            val cleanChapterUrl = chapter.url.trimEnd('/')
-            val initialUrl = if (!cleanChapterUrl.endsWith(".html")) {
-                "$internalBaseUrl$cleanChapterUrl/1.html"
-            } else {
-                "$internalBaseUrl$cleanChapterUrl"
-            }
-            innerWv.loadUrl(
-                initialUrl,
-                headers.toMap(),
+    // A manual WebView instead of runWebView: the long-strip reader needs a forced desktop-sized
+    // viewport, otherwise it only renders one tile per page.
+    @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
+    private fun createReaderWebView(
+        chapterUrl: String,
+        isWebtoon: Boolean,
+        urlSegment: String,
+        interfaceName: String,
+        jsInterface: JsInterface,
+        userAgent: String?,
+    ): WebView = WebView(applicationContext).apply {
+        settings.domStorageEnabled = true
+        settings.javaScriptEnabled = true
+        settings.blockNetworkImage = false
+        // Keep the UA matched to the rest of the traffic so Cloudflare doesn't challenge again;
+        // the desktop appearance the descrambler needs is faked at the JS layer.
+        settings.userAgentString = userAgent
+        setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+        if (isWebtoon) {
+            settings.useWideViewPort = true
+            settings.loadWithOverviewMode = false
+            measure(
+                View.MeasureSpec.makeMeasureSpec(WEBVIEW_VIEWPORT_WIDTH, View.MeasureSpec.EXACTLY),
+                View.MeasureSpec.makeMeasureSpec(WEBVIEW_VIEWPORT_HEIGHT, View.MeasureSpec.EXACTLY),
             )
+            layout(0, 0, WEBVIEW_VIEWPORT_WIDTH, WEBVIEW_VIEWPORT_HEIGHT)
         }
+        addJavascriptInterface(jsInterface, interfaceName)
 
-        val deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(3)
-        var done = false
-        while (!done && System.currentTimeMillis() < deadline) {
-            done = latch.await(5, TimeUnit.SECONDS)
-            if (!done && System.currentTimeMillis() - jsInterface.lastActivity > 45_000L) {
-                Log.d("JapscanDebug", "No page saved in 45s, timing out")
-                break
+        webViewClient = object : WebViewClient() {
+            // The reader pulls rotating ad hosts whose modals break the detached descrambler,
+            // so only the origins the reader needs are allowed.
+            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest): WebResourceResponse? {
+                val host = request.url.host ?: return null
+                return if (ALLOWED_HOSTS.any { host == it || host.endsWith(".$it") }) {
+                    null
+                } else {
+                    // A null body keeps some WebView builds pending, stalling the capture
+                    WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+                }
+            }
+
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                view?.evaluateJavascript(ACLIB_STUB, null)
+                view?.evaluateJavascript(if (isWebtoon) webtoonHooks(interfaceName) else PAGINATED_HOOK, null)
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                // Keep the detached WebView's JS timers running
+                view?.onResume()
+                view?.resumeTimers()
+                val driver = if (isWebtoon) webtoonDriver(interfaceName, urlSegment) else paginatedDriver(interfaceName)
+                view?.evaluateJavascript(driver, null)
             }
         }
-        handler.post { webView?.destroy() }
 
-        if (latch.count == 1L && jsInterface.snapshot().isEmpty()) {
-            throw Exception("Erreur lors de la récupération des pages")
-        }
-
-        val pages = jsInterface.snapshot().mapIndexed { i, path ->
-            Page(i, imageUrl = "https://$JAPSCAN_CACHE_HOST$path")
-        }
-        Log.d("JapscanDebug", "Delivering ${pages.size} verified pages to reader!")
-        pages
+        loadUrl(chapterUrl, headers.toMap())
     }
 
-    override fun pageListParse(response: Response): List<Page> = throw UnsupportedOperationException("Not used")
-
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException("Not used")
-
-    // Filters
-    private class TextField(name: String) : Filter.Text(name)
-
-    private class PageList(pages: Array<Int>) : Filter.Select<Int>("Page #", arrayOf(0, *pages))
-
-    private fun twoCaptchaApiKey() = preferences.getString(TWOCAPTCHA_API_KEY, "")?.trim().orEmpty()
-
-    // Prefs
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val chapterListPref = ListPreference(screen.context).apply {
-            key = SHOW_SPOILER_CHAPTERS
-            title = SHOW_SPOILER_CHAPTERS_TITLE
-            entries = prefsEntries
-            entryValues = prefsEntryValues
-            summary = "%s"
-            setDefaultValue("hide")
-        }
-        screen.addPreference(chapterListPref)
-
-        TwoCaptcha.addPreferenceToScreen(
-            screen = screen,
-            currentKey = twoCaptchaApiKey(),
-            title = TWOCAPTCHA_API_KEY_TITLE,
-            key = TWOCAPTCHA_API_KEY,
-        )
-    }
-
+    // Spooled pages must outlive the chapter being read (the reader may re-request them or
+    // preload the next chapter), so only files older than a day are reaped.
     private fun sweepPageCache(cacheDir: File) {
-        val cutoff = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(24)
+        val cutoff = System.currentTimeMillis() - 24.hours.inWholeMilliseconds
         cacheDir.listFiles()?.forEach {
             if (it.name.startsWith(CACHE_FILE_PREFIX) && it.lastModified() < cutoff) it.delete()
         }
@@ -939,19 +497,11 @@ abstract class Japscan :
         return List(length) { charPool.random() }.joinToString("")
     }
 
-    internal inner class JsInterface(
-        private val latch: CountDownLatch,
-        private val cacheDir: File,
-        private val handler: Handler,
-        private val webViewProvider: () -> WebView?,
-    ) {
-        @Volatile
-        var lastActivity: Long = System.currentTimeMillis()
-            private set
+    private class JsInterface(private val cacheDir: File) {
+        val done = CompletableDeferred<Unit>()
+        val activity = Channel<Unit>(Channel.CONFLATED)
 
-        private val tsSolvingStarted = java.util.concurrent.atomic.AtomicBoolean(false)
-        private val savedPaths = mutableListOf<String>()
-        private val savedHashes = mutableSetOf<String>()
+        private val savedPaths: MutableList<String> = Collections.synchronizedList(mutableListOf())
         private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}"
 
         fun snapshot(): List<String> = synchronized(savedPaths) { savedPaths.toList() }
@@ -959,85 +509,113 @@ abstract class Japscan :
         @JavascriptInterface
         @Suppress("UNUSED")
         fun savePage(dataUri: String) {
-            lastActivity = System.currentTimeMillis()
-            try {
-                val commaIdx = dataUri.indexOf(',')
-                if (commaIdx <= 0) return
-                val base64 = dataUri.substring(commaIdx + 1)
-                val bytes = Base64.decode(base64, Base64.DEFAULT)
-                val md = MessageDigest.getInstance("SHA-256")
-                val hash = md.digest(bytes).joinToString("") { "%02x".format(it) }
+            activity.trySend(Unit)
+            val commaIdx = dataUri.indexOf(',')
+            if (commaIdx <= 0) return
+            runCatching {
+                val bytes = Base64.decode(dataUri.substring(commaIdx + 1), Base64.DEFAULT)
                 synchronized(savedPaths) {
-                    if (!savedHashes.add(hash)) {
-                        Log.d("JapscanDebug", "Skipping duplicate page (hash: ${hash.take(8)})")
-                        return
-                    }
                     val file = File(cacheDir, "$sessionTag-${savedPaths.size}.bin")
                     file.writeBytes(bytes)
                     savedPaths.add(file.absolutePath)
-                    Log.d("JapscanDebug", "Saved page #${savedPaths.size} to ${file.absolutePath} (${bytes.size} bytes)")
                 }
-            } catch (e: Exception) {
-                Log.e("JapscanDebug", "Failed to save page", e)
             }
         }
 
         @JavascriptInterface
         @Suppress("UNUSED")
-        fun getSavedCount(): Int = synchronized(savedPaths) { savedPaths.size }
-
-        @JavascriptInterface
-        @Suppress("UNUSED")
-        fun log(msg: String) {
-            Log.d("JapscanDebug", "[FromJS] $msg")
-        }
-
-        @JavascriptInterface
-        @Suppress("UNUSED")
-        fun onTurnstileDetected(payloadJson: String) {
-            val solver = TwoCaptcha(twoCaptchaApiKey(), client)
-            if (!solver.isConfigured) {
-                Log.d("JapscanDebug", "Turnstile challenge detected, but 2Captcha API key is not configured.")
-                return
-            }
-            // Avoid duplicate parallel solving tasks
-            if (tsSolvingStarted.getAndSet(true)) return
-
-            Thread {
-                try {
-                    Log.d("JapscanDebug", "Starting 2Captcha Turnstile solver...")
-                    val json = kotlinx.serialization.json.Json.parseToJsonElement(payloadJson).jsonObject
-                    val token = solver.solveTurnstile(
-                        websiteUrl = json["url"]!!.string,
-                        websiteKey = json["sitekey"]!!.string,
-                        action = json["action"]?.string.orEmpty().ifEmpty { "managed" },
-                        data = json["data"]?.string.orEmpty(),
-                        pagedata = json["pagedata"]?.string.orEmpty(),
-                        userAgent = json["userAgent"]?.string.orEmpty(),
-                    )
-
-                    if (!token.isNullOrEmpty()) {
-                        Log.d("JapscanDebug", "2Captcha solved Turnstile successfully! Injecting token...")
-                        handler.post {
-                            webViewProvider()?.evaluateJavascript(
-                                "if (window.__tsCallback) { window.__tsCallback('$token'); }",
-                                null,
-                            )
-                        }
-                    } else {
-                        Log.d("JapscanDebug", "2Captcha failed to solve Turnstile within timeout.")
-                    }
-                } catch (e: Exception) {
-                    Log.e("JapscanDebug", "2Captcha Turnstile solver error", e)
-                }
-            }.start()
-        }
+        fun log(message: String) {}
 
         @JavascriptInterface
         @Suppress("UNUSED")
         fun passDone() {
-            Log.d("JapscanDebug", "passDone received! Total pages saved: ${savedPaths.size}")
-            latch.countDown()
+            done.complete(Unit)
+            activity.trySend(Unit)
         }
+    }
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        ListPreference(screen.context).apply {
+            key = SHOW_SPOILER_CHAPTERS
+            title = SHOW_SPOILER_CHAPTERS_TITLE
+            entries = arrayOf("Montrer uniquement les chapitres traduit en Français", "Montrer les chapitres spoiler")
+            entryValues = arrayOf("hide", "show")
+            summary = "%s"
+            setDefaultValue("hide")
+        }.let(screen::addPreference)
+
+        TwoCaptcha.addPreferenceToScreen(
+            screen = screen,
+            currentKey = twoCaptchaApiKey(),
+            title = TWOCAPTCHA_API_KEY_TITLE,
+            key = TWOCAPTCHA_API_KEY,
+        )
+    }
+
+    companion object {
+        private val CHAPTER_PATH_TYPES = setOf("manga", "manhua", "manhwa", "bd", "comic")
+        private val HIDDEN_STYLE_TOKENS = listOf(
+            "display:none",
+            "visibility:hidden",
+            "visibility:collapse",
+            "content-visibility:hidden",
+            "pointer-events:none",
+            "clip-path:inset(100%",
+            "clip-path:circle(0",
+            "clip-path:ellipse(0",
+            "clip-path:polygon(0,0,0,0",
+            "clip:rect(0,0,0,0",
+            "font-size:0",
+            "line-height:0",
+            "text-indent:-",
+        )
+
+        // Styles that visually remove an element while leaving it in the DOM: zero opacity/size,
+        // 3+ digit off-screen offsets or translations, and collapsed transforms. Zero values are
+        // anchored so visible values like `opacity:0.9` or `min-width:0` don't match.
+        private val HIDDEN_STYLE_REGEX = Regex(
+            """(?:^|;)opacity:0(?![.\d])""" +
+                """|filter:opacity\(0(?![.\d])""" +
+                """|(?:^|;)(?:width|height):0(?![.\d])""" +
+                """|max-(?:width|height):0(?![.\d])""" +
+                """|(?:top|bottom|left|right|inset):-?\d{3,}""" +
+                """|transform:translate(?:3d|x|y)?\([^)]*-?\d{3,}""" +
+                """|transform:scale(?:3d|x|y)?\(0[,)]""" +
+                """|transform:matrix\(0,0,0,0""",
+        )
+        private val CHAPTER_NUM_REGEX = Regex("""(?i)chapitre\s+([\d.]+)""")
+        private val NON_NUMBER_REGEX = Regex("[^0-9.]+")
+        private val CAPTCHA_REGEX = """window\.__captcha\s*=\s*\{\s*needed\s*:\s*true\s*,?""".toRegex()
+        private val DATE_FORMAT = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.US)
+        private val PARIS = ZoneId.of("Europe/Paris")
+
+        private const val SHOW_SPOILER_CHAPTERS_TITLE = "Les chapitres en Anglais ou non traduit sont upload en tant que \" Spoilers \" sur Japscan"
+        private const val SHOW_SPOILER_CHAPTERS = "JAPSCAN_SPOILER_CHAPTERS"
+        private const val TWOCAPTCHA_API_KEY = "japscan_2captcha_api_key"
+        private const val TWOCAPTCHA_API_KEY_TITLE = "Clé API 2Captcha (Résolution automatique Cloudflare Turnstile)"
+        private val STRIPS_ARRAY_REGEX = """(?:strips|"[a-f0-9]{6}")\s*:\s*(\[[^\]]*\])""".toRegex()
+        private val ELEMENT_REGEX = """\{\s*"uuid"\s*:\s*"([^"]+)"\s*,\s*"src"\s*:\s*"([^"]*)"\s*\}""".toRegex()
+        private val TOKEN_REGEX = """(?:token|"[a-f0-9]{6}")\s*:\s*"([0-9a-fA-F]{64})"""".toRegex()
+
+        private const val CACHE_HOST = "japscan-cache.local"
+        private const val CACHE_FILE_PREFIX = "japscan-"
+        private val IDLE_TIMEOUT = 45.seconds
+        private val CAPTCHA_POLL_INTERVAL = 5.seconds
+        private const val CAPTCHA_MAX_POLLS = 15
+
+        // Under ~1280px wide the long-strip reader lazy-loads tiles on scroll, which a detached
+        // WebView can't trigger; above it every tile host is created upfront.
+        private const val WEBVIEW_VIEWPORT_WIDTH = 1920
+        private const val WEBVIEW_VIEWPORT_HEIGHT = 16384
+
+        private val ALLOWED_HOSTS = listOf(
+            "japscan.foo",
+            "cdnjs.cloudflare.com",
+            "code.jquery.com",
+            "cdn.jsdelivr.net",
+            "fonts.googleapis.com",
+            "fonts.gstatic.com",
+            "challenges.cloudflare.com",
+        )
     }
 }
