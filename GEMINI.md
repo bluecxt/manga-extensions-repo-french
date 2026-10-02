@@ -54,7 +54,7 @@ Les dépôts parents configurés :
   - **Extensions spécifiques :**
     - `src/all/niadd` : Migrée vers `libVersion = 1.6` tout en préservant les correctifs custom (tri descendant des chapitres, `CHAPTER_NUMBER_REGEX` multi-langues, parsing `span.chp-title`), incrémentée à `versionCode = 4`.
     - `src/fr/perfscan` : Supprimée et consignée dans `exclude_build.json` (site mort / nom de domaine inexistant upstream #19555).
-    - `src/fr/japscan` : Protégée et préservée (fork custom avec `lib:twocaptcha`, Cloudflare Turnstile solver et lecteur déchiffré).
+    - `src/fr/japscan` : Migrée vers `libVersion = 1.6` (`KeiSource`, coroutines, `ReaderScripts.kt`, `SearchResultDto.kt`, `warmupWebViewSession`) tout en conservant le solveur custom de challenge d'images (`ImageUtils.kt` / `orderUuidsByImageVerticality`), le solveur Cloudflare Turnstile `lib:twocaptcha`, et incrémentée à `versionCode = 72`.
     - `cursed` (`master`) : `src/all/nhentai`, `ehentai`, `hitomi`, `pururin` synchronisés et conformes à `cursed/master`.
   - Validation du build : `compileDebugKotlin` validé avec succès (exit code 0 sur tous les modules).
 
@@ -85,11 +85,12 @@ git restore --source=yuzono/main -- src/fr/nouvelle_extension
 | **pururin** | `cursed` | `src/all/pururin` |
 
 ### Extensions Custom / Modifiées (Ne pas écraser depuis l'upstream)
-- **`src/fr/japscan`** : Fortement personnalisée et divergente de l'upstream Keiyoushi :
-  - Intègre la bibliothèque locale `lib:twocaptcha` (résolution automatique Cloudflare Turnstile).
-  - Intercepteur OkHttp global avec résolution headless 2Captcha et rejeu automatique (`createCloudflareInterceptor`).
+- **`src/fr/japscan`** : Personnalisée avec intégration hybride :
+  - Migrée vers `libVersion = 1.6` (`KeiSource`, `ReaderScripts.kt`, `SearchResultDto.kt`, `warmupWebViewSession`).
+  - Conserve l'algorithme custom de résolution automatique de challenge d'images Japscan (`ImageUtils.kt` avec `orderUuidsByImageVerticality` et `trySolveCustomChallenge`).
+  - Intègre la bibliothèque locale `lib:twocaptcha` (résolution automatique Cloudflare Turnstile via `createCloudflareInterceptor`).
   - Déchiffrement et chargement des pages via WebView dédiée (mangas paginés et manhwas/webtoons), déduplication SHA-256 et cache local.
-  - **Ne JAMAIS écraser ou synchroniser aveuglément Japscan depuis `upstream`** sans préserver explicitement ces modifications custom.
+  - **Ne JAMAIS écraser Japscan depuis l'upstream sans préserver ces composants custom (`ImageUtils.kt`, challenge solver, `lib:twocaptcha`, intercepteur et préférences).**
 - **`src/all/niadd`** : Modifiée pour corriger le formatage et l'ordre des chapitres :
   - Parsing corrigé du nom de chapitre ciblant `span.chp-title` (évite de concaténer vues et date dans le titre).
   - Parsing étendu du numéro de chapitre (`CHAPTER_NUMBER_REGEX` gérant Vol/Volume, Ch/Chapitre, Capitulo).
