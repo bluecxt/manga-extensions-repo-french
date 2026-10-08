@@ -39,6 +39,9 @@ class SortFilter :
     }
 }
 
+class HasAvailableChaptersFilter(name: String = "Has available chapters", defaultState: Boolean = false) :
+    Filter.CheckBox(name, defaultState)
+
 class TypeFilter :
     SelectFilter<String>(
         "Type",
