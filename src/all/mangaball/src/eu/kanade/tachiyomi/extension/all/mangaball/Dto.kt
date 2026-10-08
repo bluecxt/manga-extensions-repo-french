@@ -139,22 +139,19 @@ class ChapterDto(
     private val name: String? = null,
     private val number: Float? = null,
     private val volume: Float = 0f,
-    val lang: String,
+    private val lang: String,
     private val group: GroupDto? = null,
     @SerialName("created_at")
     private val createdAt: String? = null,
 ) {
-    fun toSChapter(langs: List<String>, addLangPrefix: Boolean = false): SChapter? {
-        if (langs.isNotEmpty() && lang !in langs) return null
+    fun toSChapter(langs: List<String>): SChapter? {
+        if (lang !in langs) return null
 
         val chapterName = name.orEmpty().trim()
 
         return SChapter.create().apply {
             url = id
             name = buildString {
-                if (addLangPrefix) {
-                    append("[", lang.uppercase(), "] ")
-                }
                 if (volume > 0) {
                     append("Vol. ", volume.toString().removeSuffix(".0"), " ")
                 }

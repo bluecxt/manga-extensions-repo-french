@@ -223,20 +223,10 @@ abstract class MangaBall :
     private suspend fun getChapterList(titleId: String): List<SChapter> {
         val body = TitleIdRequest(titleId).toJsonBody()
 
-        val allChapters = client.post("$baseUrl/api/v1/chapter/chapter-listing-by-title-id", headers, body)
+        val chapters = client.post("$baseUrl/api/v1/chapter/chapter-listing-by-title-id", headers, body)
             .parseAs<ChapterListResponse>()
             .data
-
-        var chapters = allChapters.mapNotNull { it.toSChapter(siteLang) }
-
-        if (chapters.isEmpty() && allowOtherLanguagesPreference()) {
-            val englishChapters = allChapters.mapNotNull { it.toSChapter(listOf("en"), addLangPrefix = true) }
-            chapters = if (englishChapters.isNotEmpty()) {
-                englishChapters
-            } else {
-                allChapters.mapNotNull { it.toSChapter(emptyList(), addLangPrefix = true) }
-            }
-        }
+            .mapNotNull { it.toSChapter(siteLang) }
 
         preferences.rememberScanlators(chapters.mapNotNull { it.scanlator })
 
@@ -282,13 +272,6 @@ abstract class MangaBall :
         }.also(screen::addPreference)
 
         SwitchPreferenceCompat(screen.context).apply {
-            key = ALLOW_OTHER_LANGS_PREF
-            title = "Fallback to other languages"
-            summary = "If no chapters are found in this language, load available English or foreign chapters to avoid errors"
-            setDefaultValue(true)
-        }.also(screen::addPreference)
-
-        SwitchPreferenceCompat(screen.context).apply {
             key = NSFW_PREF
             title = "Hide NSFW content"
             summary = "Hide titles marked as 18+"
@@ -300,11 +283,9 @@ abstract class MangaBall :
 
     private fun hideNsfwPreference() = preferences.getBoolean(NSFW_PREF, false)
     private fun hasAvailableChaptersPreference() = preferences.getBoolean(HAS_AVAILABLE_CHAPTERS_PREF, false)
-    private fun allowOtherLanguagesPreference() = preferences.getBoolean(ALLOW_OTHER_LANGS_PREF, true)
 }
 
 private const val HAS_AVAILABLE_CHAPTERS_PREF = "has_available_chapters_pref"
-private const val ALLOW_OTHER_LANGS_PREF = "allow_other_langs_pref"
 private const val NSFW_PREF = "nsfw_pref"
 private const val LEGACY_HOST = "mangaball.net"
 
