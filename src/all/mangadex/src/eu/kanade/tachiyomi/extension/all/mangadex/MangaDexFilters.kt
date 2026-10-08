@@ -19,7 +19,12 @@ class MangaDexFilters {
         dexLang: String,
         intl: Intl,
     ): FilterList = FilterList(
-        HasAvailableChaptersFilter(intl),
+        // BLC -->
+        HasAvailableChaptersFilter(
+            intl,
+            preferences.getBoolean(MDConstants.getHasAvailableChaptersPrefKey(dexLang), false),
+        ),
+        // BLC <--
         OriginalLanguageList(intl, getOriginalLanguage(preferences, dexLang, intl)),
         ContentRatingList(intl, getContentRating(preferences, dexLang, intl)),
         DemographicList(intl, getDemographics(intl)),
@@ -47,9 +52,11 @@ class MangaDexFilters {
         fun addQueryParameter(url: HttpUrl.Builder, dexLang: String)
     }
 
-    private class HasAvailableChaptersFilter(intl: Intl) :
-        Filter.CheckBox(intl["has_available_chapters"]),
+    // BLC -->
+    private class HasAvailableChaptersFilter(intl: Intl, defaultState: Boolean = false) :
+        Filter.CheckBox(intl["has_available_chapters"], defaultState),
         UrlQueryFilter {
+    // BLC <--
 
         override fun addQueryParameter(url: HttpUrl.Builder, dexLang: String) {
             if (state) {
