@@ -104,11 +104,17 @@ abstract class MangaBall :
     ): MangasPage {
         val sort = filters.firstInstanceOrNull<SortFilter>()
 
+        // The API only orders by relevance when sort_by is omitted, which "Relevance" maps to.
+        // Keyword-less browse falls back to last-updated so it stays ordered.
+        val effectiveSortBy = sortBy ?: sort?.sortBy ?: if (query.isBlank()) "lastupdate" else null
+
         val url = "$baseUrl/api/v1/title/search-advanced".toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
             addQueryParameter("limit", "24")
-            addQueryParameter("sort_by", sortBy ?: sort?.sortBy ?: "lastupdate")
-            addQueryParameter("sort_order", sortOrder ?: sort?.sortOrder ?: "desc")
+            if (effectiveSortBy != null) {
+                addQueryParameter("sort_by", effectiveSortBy)
+                addQueryParameter("sort_order", sortOrder ?: sort?.sortOrder ?: "desc")
+            }
             addQueryParameter("tag_mode", filters.firstInstanceOrNull<TagModeFilter>()?.selected ?: "AND")
             addQueryParameter("adult_mode", if (hideNsfwPreference()) "no_18" else "all")
 
@@ -132,6 +138,14 @@ abstract class MangaBall :
             if (excluded.isNotEmpty()) {
                 addQueryParameter("excluded_tags", excluded.joinToString(","))
             }
+
+            // BLC -->
+            val hasAvailableChapters = filters.firstInstanceOrNull<HasAvailableChaptersFilter>()?.state
+                ?: hasAvailableChaptersPreference()
+            if (hasAvailableChapters && siteLang.isNotEmpty()) {
+                addQueryParameter("translated_language", siteLang.first())
+            }
+            // BLC <--
         }.build()
 
         return client.get(url, headers).parseAs<SearchResponse>().toMangasPage()
@@ -139,6 +153,9 @@ abstract class MangaBall :
 
     override fun getFilterList(data: JsonElement?) = FilterList(
         SortFilter(),
+        // BLC -->
+        HasAvailableChaptersFilter(defaultState = hasAvailableChaptersPreference()),
+        // BLC <--
         TypeFilter(),
         DemographicFilter(),
         StatusFilter(),
@@ -251,6 +268,15 @@ abstract class MangaBall :
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        // BLC -->
+        SwitchPreferenceCompat(screen.context).apply {
+            key = HAS_AVAILABLE_CHAPTERS_PREF
+            title = "Has available chapters"
+            summary = "Only show titles that have chapters in the source language during searches/browse"
+            setDefaultValue(false)
+        }.also(screen::addPreference)
+        // BLC <--
+
         SwitchPreferenceCompat(screen.context).apply {
             key = NSFW_PREF
             title = "Hide NSFW content"
@@ -262,8 +288,16 @@ abstract class MangaBall :
     }
 
     private fun hideNsfwPreference() = preferences.getBoolean(NSFW_PREF, false)
+
+    // BLC -->
+    private fun hasAvailableChaptersPreference() = preferences.getBoolean(HAS_AVAILABLE_CHAPTERS_PREF, false)
+    // BLC <--
 }
 
+// BLC -->
+private const val HAS_AVAILABLE_CHAPTERS_PREF = "has_available_chapters_pref"
+
+// BLC <--
 private const val NSFW_PREF = "nsfw_pref"
 private const val LEGACY_HOST = "mangaball.net"
 
