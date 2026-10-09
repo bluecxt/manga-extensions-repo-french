@@ -56,7 +56,7 @@ class MangaDexFilters {
     private class HasAvailableChaptersFilter(intl: Intl, defaultState: Boolean = false) :
         Filter.CheckBox(intl["has_available_chapters"], defaultState),
         UrlQueryFilter {
-    // BLC <--
+        // BLC <--
 
         override fun addQueryParameter(url: HttpUrl.Builder, dexLang: String) {
             if (state) {

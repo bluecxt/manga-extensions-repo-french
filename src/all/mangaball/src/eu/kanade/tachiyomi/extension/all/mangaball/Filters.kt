@@ -40,8 +40,7 @@ class SortFilter :
 }
 
 // BLC -->
-class HasAvailableChaptersFilter(name: String = "Has available chapters", defaultState: Boolean = false) :
-    Filter.CheckBox(name, defaultState)
+class HasAvailableChaptersFilter(name: String = "Has available chapters", defaultState: Boolean = false) : Filter.CheckBox(name, defaultState)
 // BLC <--
 
 class TypeFilter :

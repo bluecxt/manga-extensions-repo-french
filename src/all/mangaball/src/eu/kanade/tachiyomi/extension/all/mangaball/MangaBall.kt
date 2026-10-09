@@ -288,6 +288,7 @@ abstract class MangaBall :
     }
 
     private fun hideNsfwPreference() = preferences.getBoolean(NSFW_PREF, false)
+
     // BLC -->
     private fun hasAvailableChaptersPreference() = preferences.getBoolean(HAS_AVAILABLE_CHAPTERS_PREF, false)
     // BLC <--
@@ -295,6 +296,7 @@ abstract class MangaBall :
 
 // BLC -->
 private const val HAS_AVAILABLE_CHAPTERS_PREF = "has_available_chapters_pref"
+
 // BLC <--
 private const val NSFW_PREF = "nsfw_pref"
 private const val LEGACY_HOST = "mangaball.net"

@@ -130,16 +130,29 @@ class ExtensionPlugin : Plugin<Project> {
         }.orElse(keiyoushi.versionCode.zip(keiyoushi.kmkVersionCode.orElse(0)) { kei, kmk -> kei + kmk })
         // KMK <--
 
+        val revisionProvider = themeExtension.flatMap { themeKeiyoushi ->
+            themeKeiyoushi.revision.zip(keiyoushi.revision) { themeRev, extRev -> themeRev + extRev }
+                .orElse(themeKeiyoushi.revision)
+                .orElse(keiyoushi.revision)
+        }.orElse(keiyoushi.revision)
+
         val versionNameProvider = keiyoushi.libVersion.flatMap { libVersion ->
             check(libVersion in VALID_LIB_VERSIONS) {
                 "libVersion $libVersion is not supported. Supported versions: $VALID_LIB_VERSIONS"
             }
-            versionCodeProvider.map { "$libVersion.$it" }
+            versionCodeProvider.flatMap { versionCode ->
+                revisionProvider.map { rev ->
+                    "$libVersion.$versionCode.$rev"
+                }.orElse("$libVersion.$versionCode")
+            }
         }
 
         val androidVersionCodeProvider = keiyoushi.libVersion.flatMap { libVersion ->
-            versionCodeProvider.map { versionCode ->
-                libVersion.split(".").joinToString("") { it.padStart(2, '0') }.toInt().times(1000) + versionCode
+            versionCodeProvider.flatMap { versionCode ->
+                val baseAndroidCode = libVersion.split(".").joinToString("") { it.padStart(2, '0') }.toInt().times(1000) + versionCode
+                revisionProvider.map { rev ->
+                    baseAndroidCode + rev
+                }.orElse(baseAndroidCode)
             }
         }
 
