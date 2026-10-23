@@ -6,7 +6,8 @@ plugins {
 
 keiyoushi {
     name = "Niadd"
-    versionCode = 4
+    versionCode = 1
+    revision = 1
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 

@@ -133,6 +133,11 @@ object MDConstants {
     private const val INCLUDE_UNAVAILABLE_PREF = "includeUnavailable"
     fun getIncludeUnavailablePrefKey(dexLang: String): String = "${INCLUDE_UNAVAILABLE_PREF}_$dexLang"
 
+    // BLC -->
+    private const val HAS_AVAILABLE_CHAPTERS_PREF = "hasAvailableChapters"
+    fun getHasAvailableChaptersPrefKey(dexLang: String): String = "${HAS_AVAILABLE_CHAPTERS_PREF}_$dexLang"
+    // BLC <--
+
     private const val TAG_GROUP_CONTENT = "content"
     private const val TAG_GROUP_FORMAT = "format"
     private const val TAG_GROUP_GENRE = "genre"

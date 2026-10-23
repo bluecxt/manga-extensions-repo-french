@@ -832,6 +832,23 @@ class MangaDex(
             }
         }
 
+        // BLC -->
+        val hasAvailableChaptersPref = SwitchPreferenceCompat(screen.context).apply {
+            key = MDConstants.getHasAvailableChaptersPrefKey(dexLang)
+            title = helper.intl["has_available_chapters"]
+            summary = "Only show titles that have chapters in the source language during searches"
+            setDefaultValue(false)
+
+            setOnPreferenceChangeListener { _, newValue ->
+                val checkValue = newValue as Boolean
+
+                preferences.edit()
+                    .putBoolean(MDConstants.getHasAvailableChaptersPrefKey(dexLang), checkValue)
+                    .commit()
+            }
+        }
+        // BLC <--
+
         screen.addPreference(coverQualityPref)
         screen.addPreference(tryUsingFirstVolumeCoverPref)
         screen.addPreference(dataSaverPref)
@@ -840,6 +857,9 @@ class MangaDex(
         screen.addPreference(preferExtensionLangTitlePref)
         screen.addPreference(finalChapterInDescPref)
         screen.addPreference(includeUnavailablePref)
+        // BLC -->
+        screen.addPreference(hasAvailableChaptersPref)
+        // BLC <--
         screen.addPreference(contentRatingPref)
         screen.addPreference(originalLanguagePref)
         screen.addPreference(blockedGroupsPref)
@@ -940,6 +960,11 @@ class MangaDex(
 
     private val SharedPreferences.includeUnavailable
         get() = getBoolean(MDConstants.getIncludeUnavailablePrefKey(dexLang), false)
+
+    // BLC -->
+    private val SharedPreferences.hasAvailableChapters
+        get() = getBoolean(MDConstants.getHasAvailableChaptersPrefKey(dexLang), false)
+    // BLC <--
 
     /**
      * Previous versions of the extension allowed invalid UUID values to be stored in the
