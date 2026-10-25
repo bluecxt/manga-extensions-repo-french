@@ -21,22 +21,41 @@ import keiyoushi.utils.parseAs
 import kotlinx.serialization.json.JsonElement
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 
 @Source
 class HentaiPaw(
     override val name: String,
     override val lang: String,
-    override val baseUrl: String,
+    baseUrl: String,
     override val id: Long,
 ) : KeiSource(),
     ConfigurableSource {
+
+    override val baseUrl: String
+        get() = apiUrl
 
     private val preferences by getPreferencesLazy()
 
     private val globalPrefs: SharedPreferences by lazy {
         applicationContext.getSharedPreferences("hentaipaw_global_prefs", 0)
     }
+
+    private val apiUrl: String
+        get() {
+            val global = globalPrefs.getString(API_URL_PREF, "")?.trim().orEmpty().removeSuffix("/")
+            if (global.isNotEmpty()) return global
+
+            // Fallback: search source-specific preferences and migrate to global
+            val fromSource = preferences.getString(API_URL_PREF, "")?.trim().orEmpty().removeSuffix("/")
+            if (fromSource.isNotEmpty()) {
+                Log.d(TAG, "[$lang] Migrating API URL from source pref to global: $fromSource")
+                globalPrefs.edit().putString(API_URL_PREF, fromSource).apply()
+                return fromSource
+            }
+            return ""
+        }
 
     private val apiSecret: String
         get() {
@@ -61,10 +80,13 @@ class HentaiPaw(
         }
 
     private fun ensureConfigured() {
+        val url = apiUrl
+        if (url.isBlank()) {
+            throw Exception("Adresse de l'API non configurée : veuillez renseigner l'URL de votre serveur Paw Bridge (ex: https://server-paw-bridge.tailb8bddd.ts.net) dans les paramètres de l'extension.")
+        }
         val secret = apiSecret
-        Log.d(TAG, "[$lang] ensureConfigured() checking secret: isBlank=${secret.isBlank()}")
         if (secret.isBlank()) {
-            throw Exception("Clé API manquante : veuillez renseigner votre 'Clé secrète API' dans les paramètres de l'extension HentaiPaw.")
+            throw Exception("Clé API manquante : veuillez renseigner votre 'Clé secrète API' dans les paramètres de l'extension.")
         }
     }
 
@@ -77,9 +99,9 @@ class HentaiPaw(
         addInterceptor { chain ->
             val request = chain.request()
             val requestHost = request.url.host
-            val apiHost = baseUrl.toHttpUrl().host
+            val currentApiHost = apiUrl.toHttpUrlOrNull()?.host
 
-            if (requestHost == apiHost) {
+            if (currentApiHost != null && requestHost == currentApiHost) {
                 val secret = apiSecret
                 Log.d(TAG, "[$lang] API request: ${request.method} ${request.url.encodedPath} (hasSecret=${secret.isNotBlank()})")
                 if (secret.isBlank()) {
@@ -107,9 +129,11 @@ class HentaiPaw(
 
     private val filterOptions: FilterOptionsDto by lazy {
         try {
+            val url = apiUrl
+            if (url.isBlank()) return@lazy FilterOptionsDto()
             val secret = apiSecret
             val req = okhttp3.Request.Builder()
-                .url("$baseUrl/api/manga/filters")
+                .url("$url/api/manga/filters")
                 .header("X-Paw-Secret", secret)
                 .header("Authorization", "Bearer $secret")
                 .build()
@@ -301,9 +325,28 @@ class HentaiPaw(
     // Preferences
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
+            key = API_URL_PREF
+            title = "Adresse de l'API Paw Bridge"
+            summary = apiUrl.ifBlank { "Non configurée (ex: https://server-paw-bridge.tailb8bddd.ts.net)" }
+            dialogTitle = "URL du serveur Paw Bridge"
+            dialogMessage = "Entrez l'URL de votre serveur Paw Bridge (ex: https://server-paw-bridge.tailb8bddd.ts.net)"
+            text = apiUrl
+            setDefaultValue("")
+            setOnPreferenceChangeListener { _, newValue ->
+                val newUrl = newValue.toString().trim().removeSuffix("/")
+                Log.d(TAG, "[$lang] Setting new API URL: $newUrl")
+                globalPrefs.edit().putString(API_URL_PREF, newUrl).apply()
+                preferences.edit().putString(API_URL_PREF, newUrl).apply()
+                summary = newUrl.ifBlank { "Non configurée (ex: https://server-paw-bridge.tailb8bddd.ts.net)" }
+                true
+            }
+        }.also(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
             key = API_SECRET_PREF
             title = "Clé secrète API"
-            summary = "Secret requis pour autoriser les requêtes vers l'API privée"
+            summary = if (apiSecret.isNotBlank()) "••••••••" else "Non configurée"
+            dialogTitle = "Clé secrète de l'API Paw Bridge"
             text = apiSecret
             setDefaultValue("")
             setOnPreferenceChangeListener { _, newValue ->
@@ -311,6 +354,7 @@ class HentaiPaw(
                 Log.d(TAG, "[$lang] Setting new API secret (len=${secret.length})")
                 globalPrefs.edit().putString(API_SECRET_PREF, secret).apply()
                 preferences.edit().putString(API_SECRET_PREF, secret).apply()
+                summary = if (secret.isNotBlank()) "••••••••" else "Non configurée"
                 true
             }
         }.also(screen::addPreference)
@@ -318,6 +362,7 @@ class HentaiPaw(
 
     companion object {
         private const val TAG = "HentaiPaw"
+        private const val API_URL_PREF = "paw_api_url"
         private const val API_SECRET_PREF = "paw_api_secret"
     }
 }
