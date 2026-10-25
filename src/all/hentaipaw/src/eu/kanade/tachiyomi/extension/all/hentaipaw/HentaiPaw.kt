@@ -132,14 +132,11 @@ class HentaiPaw(
         ensureConfigured()
         val targetLang = apiLang
         val url = if (targetLang != null) {
-            "$baseUrl/api/manga/search?page=$page&lang=$targetLang"
+            "$baseUrl/api/manga/popular?page=$page&lang=$targetLang"
         } else {
             "$baseUrl/api/manga/popular?page=$page"
         }
         val dto = client.get(url).parseAs<MangaListPageDto>()
-        if (dto.mangas.isEmpty() && lang == "fr") {
-            throw Exception("Aucune œuvre en français disponible sur HentaiPaw (le catalogue propose : Anglais, Japonais, Chinois, Espagnol). Veuillez utiliser la source HentaiPaw (en) ou HentaiPaw (all).")
-        }
         return MangasPage(dto.mangas.map { it.toSManga() }, dto.hasNextPage)
     }
 
@@ -148,14 +145,11 @@ class HentaiPaw(
         ensureConfigured()
         val targetLang = apiLang
         val url = if (targetLang != null) {
-            "$baseUrl/api/manga/search?page=$page&lang=$targetLang"
+            "$baseUrl/api/manga/latest?page=$page&lang=$targetLang"
         } else {
             "$baseUrl/api/manga/latest?page=$page"
         }
         val dto = client.get(url).parseAs<MangaListPageDto>()
-        if (dto.mangas.isEmpty() && lang == "fr") {
-            throw Exception("Aucune œuvre en français disponible sur HentaiPaw (le catalogue propose : Anglais, Japonais, Chinois, Espagnol). Veuillez utiliser la source HentaiPaw (en) ou HentaiPaw (all).")
-        }
         return MangasPage(dto.mangas.map { it.toSManga() }, dto.hasNextPage)
     }
 
