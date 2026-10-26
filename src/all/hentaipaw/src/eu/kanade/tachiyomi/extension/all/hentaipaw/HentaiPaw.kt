@@ -82,7 +82,7 @@ class HentaiPaw(
     private fun ensureConfigured() {
         val url = apiUrl
         if (url.isBlank()) {
-            throw Exception("Adresse de l'API non configurée : veuillez renseigner l'URL de votre serveur Paw Bridge (ex: https://server-paw-bridge.tailb8bddd.ts.net) dans les paramètres de l'extension.")
+            throw Exception("Adresse de l'API non configurée : veuillez renseigner l'URL de votre serveur Paw Bridge dans les paramètres de l'extension.")
         }
         val secret = apiSecret
         if (secret.isBlank()) {
@@ -327,9 +327,9 @@ class HentaiPaw(
         EditTextPreference(screen.context).apply {
             key = API_URL_PREF
             title = "Adresse de l'API Paw Bridge"
-            summary = apiUrl.ifBlank { "Non configurée (ex: https://server-paw-bridge.tailb8bddd.ts.net)" }
+            summary = apiUrl.ifBlank { "Non configurée" }
             dialogTitle = "URL du serveur Paw Bridge"
-            dialogMessage = "Entrez l'URL de votre serveur Paw Bridge (ex: https://server-paw-bridge.tailb8bddd.ts.net)"
+            dialogMessage = "Entrez l'URL de votre serveur Paw Bridge (contacter le dev pour plus d'info)"
             text = apiUrl
             setDefaultValue("")
             setOnPreferenceChangeListener { _, newValue ->
@@ -337,7 +337,7 @@ class HentaiPaw(
                 Log.d(TAG, "[$lang] Setting new API URL: $newUrl")
                 globalPrefs.edit().putString(API_URL_PREF, newUrl).apply()
                 preferences.edit().putString(API_URL_PREF, newUrl).apply()
-                summary = newUrl.ifBlank { "Non configurée (ex: https://server-paw-bridge.tailb8bddd.ts.net)" }
+                summary = newUrl.ifBlank { "Non configurée" }
                 true
             }
         }.also(screen::addPreference)
