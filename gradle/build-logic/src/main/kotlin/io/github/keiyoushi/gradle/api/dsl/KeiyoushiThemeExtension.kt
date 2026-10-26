@@ -14,7 +14,6 @@ abstract class KeiyoushiThemeExtension @Inject constructor(
 
     // KMK -->
     abstract val kmkBaseVersionCode: Property<Int>
-    abstract val revision: Property<Int>
     // KMK <--
 
     abstract val deeplinks: ListProperty<ExtensionDeeplink>

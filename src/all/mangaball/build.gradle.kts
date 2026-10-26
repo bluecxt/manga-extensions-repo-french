@@ -6,8 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Manga Ball"
-    versionCode = 5
-    revision = 1
+    versionCode = 6 // upstream: 5
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 

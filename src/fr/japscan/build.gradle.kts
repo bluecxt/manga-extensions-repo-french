@@ -6,8 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Japscan"
-    versionCode = 0
-    revision = 1
+    versionCode = 73 // upstream: none
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 

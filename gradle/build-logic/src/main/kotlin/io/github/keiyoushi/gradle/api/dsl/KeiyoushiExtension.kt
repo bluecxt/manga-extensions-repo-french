@@ -20,7 +20,6 @@ abstract class KeiyoushiExtension @Inject constructor(
 
     // KMK -->
     abstract val kmkVersionCode: Property<Int>
-    abstract val revision: Property<Int>
     // KMK <--
 
     abstract val deeplinks: ListProperty<ExtensionDeeplink>
