@@ -207,7 +207,8 @@ class HentaiPaw(
         if (inMemoryFilters == null || inMemoryFilters?.tags?.isEmpty() == true) {
             loadCachedFilters()
         }
-        return inMemoryFilters ?: FilterOptionsDto()
+        val current = inMemoryFilters
+        return if (current != null && current.tags.isNotEmpty()) current else DEFAULT_FILTER_OPTIONS
     }
 
     // Popular Manga
@@ -257,42 +258,78 @@ class HentaiPaw(
                 }
             }
 
-            // Helper to extract checkbox IDs and text includes/excludes from a Group<Filter<*>>
-            fun extractFacetGroup(group: Filter.Group<Filter<*>>?, includeParam: String, excludeParam: String) {
-                if (group == null) return
-                val checkedIds = group.state.filterIsInstance<FacetCheckBox>().filter { it.state }.map { it.id.toString() }
-                val textInclude = group.state.filterIsInstance<TextIncludeFilter>().firstOrNull()?.state?.trim().orEmpty()
-                val textExclude = group.state.filterIsInstance<TextExcludeFilter>().firstOrNull()?.state?.trim().orEmpty()
+            fun extractFacet(
+                group: Filter.Group<FacetCheckBox>?,
+                includeFilter: Filter.Text?,
+                excludeFilter: Filter.Text?,
+                incParam: String,
+                excParam: String,
+            ) {
+                val checkedIds = group?.state?.filter { it.state }?.map { it.id.toString() } ?: emptyList()
+                val textInc = includeFilter?.state?.trim().orEmpty()
+                val textExc = excludeFilter?.state?.trim().orEmpty()
 
                 val includes = mutableListOf<String>()
                 includes.addAll(checkedIds)
-                if (textInclude.isNotEmpty()) {
-                    textInclude.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { includes.add(it) }
+                if (textInc.isNotEmpty()) {
+                    textInc.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { includes.add(it) }
                 }
                 if (includes.isNotEmpty()) {
-                    addQueryParameter(includeParam, includes.joinToString(","))
+                    addQueryParameter(incParam, includes.joinToString(","))
                 }
 
-                if (textExclude.isNotEmpty()) {
-                    val excludes = textExclude.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                if (textExc.isNotEmpty()) {
+                    val excludes = textExc.split(",").map { it.trim() }.filter { it.isNotEmpty() }
                     if (excludes.isNotEmpty()) {
-                        addQueryParameter(excludeParam, excludes.joinToString(","))
+                        addQueryParameter(excParam, excludes.joinToString(","))
                     }
                 }
             }
 
-            extractFacetGroup(filters.filterIsInstance<TagFilterGroup>().firstOrNull(), "tag", "exclude_tag")
-            extractFacetGroup(filters.filterIsInstance<ArtistFilterGroup>().firstOrNull(), "artist", "exclude_artist")
-            extractFacetGroup(filters.filterIsInstance<CharacterFilterGroup>().firstOrNull(), "character", "exclude_character")
-            extractFacetGroup(filters.filterIsInstance<ParodyFilterGroup>().firstOrNull(), "parody", "exclude_parody")
-            extractFacetGroup(filters.filterIsInstance<GroupFilterGroup>().firstOrNull(), "group", "exclude_group")
+            extractFacet(
+                filters.filterIsInstance<TagGroup>().firstOrNull(),
+                filters.filterIsInstance<TagIncludeFilter>().firstOrNull(),
+                filters.filterIsInstance<TagExcludeFilter>().firstOrNull(),
+                "tag",
+                "exclude_tag",
+            )
 
-            // Pages count filters inside PagesFilterGroup
-            val pagesGroup = filters.filterIsInstance<PagesFilterGroup>().firstOrNull()
-            pagesGroup?.state?.filterIsInstance<MinPagesFilter>()?.firstOrNull()?.state?.trim()?.toIntOrNull()?.let {
+            extractFacet(
+                filters.filterIsInstance<ArtistGroup>().firstOrNull(),
+                filters.filterIsInstance<ArtistIncludeFilter>().firstOrNull(),
+                filters.filterIsInstance<ArtistExcludeFilter>().firstOrNull(),
+                "artist",
+                "exclude_artist",
+            )
+
+            extractFacet(
+                filters.filterIsInstance<CharacterGroup>().firstOrNull(),
+                filters.filterIsInstance<CharacterIncludeFilter>().firstOrNull(),
+                filters.filterIsInstance<CharacterExcludeFilter>().firstOrNull(),
+                "character",
+                "exclude_character",
+            )
+
+            extractFacet(
+                filters.filterIsInstance<ParodyGroup>().firstOrNull(),
+                filters.filterIsInstance<ParodyIncludeFilter>().firstOrNull(),
+                filters.filterIsInstance<ParodyExcludeFilter>().firstOrNull(),
+                "parody",
+                "exclude_parody",
+            )
+
+            extractFacet(
+                filters.filterIsInstance<CircleGroup>().firstOrNull(),
+                filters.filterIsInstance<GroupIncludeFilter>().firstOrNull(),
+                filters.filterIsInstance<GroupExcludeFilter>().firstOrNull(),
+                "group",
+                "exclude_group",
+            )
+
+            filters.filterIsInstance<MinPagesFilter>().firstOrNull()?.state?.trim()?.toIntOrNull()?.let {
                 addQueryParameter("min_pages", it.toString())
             }
-            pagesGroup?.state?.filterIsInstance<MaxPagesFilter>()?.firstOrNull()?.state?.trim()?.toIntOrNull()?.let {
+            filters.filterIsInstance<MaxPagesFilter>().firstOrNull()?.state?.trim()?.toIntOrNull()?.let {
                 addQueryParameter("max_pages", it.toString())
             }
 
@@ -362,7 +399,7 @@ class HentaiPaw(
     // Filters UI
     override fun getFilterList(data: JsonElement?): FilterList {
         val opts = getFilterOptionsSafe()
-        if (opts.tags.isEmpty()) {
+        if (inMemoryFilters == null || inMemoryFilters?.tags?.isEmpty() == true) {
             scope.launch { fetchPopularFiltersAsync(force = true) }
         }
 
@@ -376,77 +413,75 @@ class HentaiPaw(
         // 2. Tri
         filters.add(SortFilter())
 
-        // 3. Pages (catégorie pliable)
-        filters.add(PagesFilterGroup())
+        // 3. Pages
+        filters.add(Filter.Header("Pages"))
+        filters.add(MinPagesFilter())
+        filters.add(MaxPagesFilter())
 
-        // 4. Catégories taxonomiques (titres épurés)
-        filters.add(TagFilterGroup(opts.tags))
-        filters.add(ArtistFilterGroup(opts.artists))
-        filters.add(CharacterFilterGroup(opts.characters))
-        filters.add(ParodyFilterGroup(opts.parodies))
-        filters.add(GroupFilterGroup(opts.groups))
+        // 4. Tags
+        filters.add(Filter.Header("Tags"))
+        filters.add(TagGroup(opts.tags))
+        filters.add(TagIncludeFilter())
+        filters.add(TagExcludeFilter())
+
+        // 5. Artistes
+        filters.add(Filter.Header("Artistes"))
+        filters.add(ArtistGroup(opts.artists))
+        filters.add(ArtistIncludeFilter())
+        filters.add(ArtistExcludeFilter())
+
+        // 6. Personnages
+        filters.add(Filter.Header("Personnages"))
+        filters.add(CharacterGroup(opts.characters))
+        filters.add(CharacterIncludeFilter())
+        filters.add(CharacterExcludeFilter())
+
+        // 7. Parodies
+        filters.add(Filter.Header("Parodies"))
+        filters.add(ParodyGroup(opts.parodies))
+        filters.add(ParodyIncludeFilter())
+        filters.add(ParodyExcludeFilter())
+
+        // 8. Groupes
+        filters.add(Filter.Header("Groupes"))
+        filters.add(CircleGroup(opts.groups))
+        filters.add(GroupIncludeFilter())
+        filters.add(GroupExcludeFilter())
 
         return FilterList(filters)
     }
 
     // Filter Models
     class FacetCheckBox(name: String, val id: Int) : Filter.CheckBox(name)
-    class TextIncludeFilter(name: String) : Filter.Text(name)
-    class TextExcludeFilter(name: String) : Filter.Text(name)
 
-    class TagFilterGroup(tags: List<FilterItemDto>) :
-        Filter.Group<Filter<*>>(
-            "Tags",
-            tags.map { FacetCheckBox(it.name, it.id) } + listOf(
-                TextIncludeFilter("Autre tag ou ID (+)"),
-                TextExcludeFilter("Exclure tag (-)"),
-            ),
-        )
+    // Tags
+    class TagGroup(tags: List<FilterItemDto>) : Filter.Group<FacetCheckBox>("Tags populaires", tags.map { FacetCheckBox(it.name, it.id) })
+    class TagIncludeFilter : Filter.Text("Autre tag ou ID (+)")
+    class TagExcludeFilter : Filter.Text("Exclure tag (-)")
 
-    class ArtistFilterGroup(artists: List<FilterItemDto>) :
-        Filter.Group<Filter<*>>(
-            "Artistes",
-            artists.map { FacetCheckBox(it.name, it.id) } + listOf(
-                TextIncludeFilter("Autre artiste ou ID (+)"),
-                TextExcludeFilter("Exclure artiste (-)"),
-            ),
-        )
+    // Artistes
+    class ArtistGroup(artists: List<FilterItemDto>) : Filter.Group<FacetCheckBox>("Artistes populaires", artists.map { FacetCheckBox(it.name, it.id) })
+    class ArtistIncludeFilter : Filter.Text("Autre artiste ou ID (+)")
+    class ArtistExcludeFilter : Filter.Text("Exclure artiste (-)")
 
-    class CharacterFilterGroup(characters: List<FilterItemDto>) :
-        Filter.Group<Filter<*>>(
-            "Personnages",
-            characters.map { FacetCheckBox(it.name, it.id) } + listOf(
-                TextIncludeFilter("Autre personnage ou ID (+)"),
-                TextExcludeFilter("Exclure personnage (-)"),
-            ),
-        )
+    // Personnages
+    class CharacterGroup(characters: List<FilterItemDto>) : Filter.Group<FacetCheckBox>("Personnages populaires", characters.map { FacetCheckBox(it.name, it.id) })
+    class CharacterIncludeFilter : Filter.Text("Autre personnage ou ID (+)")
+    class CharacterExcludeFilter : Filter.Text("Exclure personnage (-)")
 
-    class ParodyFilterGroup(parodies: List<FilterItemDto>) :
-        Filter.Group<Filter<*>>(
-            "Parodies",
-            parodies.map { FacetCheckBox(it.name, it.id) } + listOf(
-                TextIncludeFilter("Autre parodie ou ID (+)"),
-                TextExcludeFilter("Exclure parodie (-)"),
-            ),
-        )
+    // Parodies
+    class ParodyGroup(parodies: List<FilterItemDto>) : Filter.Group<FacetCheckBox>("Parodies populaires", parodies.map { FacetCheckBox(it.name, it.id) })
+    class ParodyIncludeFilter : Filter.Text("Autre parodie ou ID (+)")
+    class ParodyExcludeFilter : Filter.Text("Exclure parodie (-)")
 
-    class GroupFilterGroup(groups: List<FilterItemDto>) :
-        Filter.Group<Filter<*>>(
-            "Groupes",
-            groups.map { FacetCheckBox(it.name, it.id) } + listOf(
-                TextIncludeFilter("Autre groupe ou ID (+)"),
-                TextExcludeFilter("Exclure groupe (-)"),
-            ),
-        )
+    // Groupes
+    class CircleGroup(groups: List<FilterItemDto>) : Filter.Group<FacetCheckBox>("Groupes populaires", groups.map { FacetCheckBox(it.name, it.id) })
+    class GroupIncludeFilter : Filter.Text("Autre groupe ou ID (+)")
+    class GroupExcludeFilter : Filter.Text("Exclure groupe (-)")
 
+    // Pages
     class MinPagesFilter : Filter.Text("Pages minimum")
     class MaxPagesFilter : Filter.Text("Pages maximum")
-
-    class PagesFilterGroup :
-        Filter.Group<Filter.Text>(
-            "Pages",
-            listOf(MinPagesFilter(), MaxPagesFilter()),
-        )
 
     class LanguageCheckBox(name: String, val code: String) : Filter.CheckBox(name)
 
@@ -525,5 +560,143 @@ class HentaiPaw(
         private const val API_SECRET_PREF = "paw_api_secret"
         private const val CACHED_FILTERS_PREF = "hentaipaw_cached_filters_json"
         private const val FILTERS_LAST_FETCH_PREF = "hentaipaw_filters_last_fetch"
+
+        private val DEFAULT_FILTER_OPTIONS = FilterOptionsDto(
+            tags = listOf(
+                FilterItemDto(5744, "sole female"),
+                FilterItemDto(186, "big breasts"),
+                FilterItemDto(5745, "sole male"),
+                FilterItemDto(4170, "nakadashi"),
+                FilterItemDto(7497, "rough translation"),
+                FilterItemDto(447, "blowjob"),
+                FilterItemDto(5275, "schoolgirl uniform"),
+                FilterItemDto(1400, "full color"),
+                FilterItemDto(2577, "mosaic censorship"),
+                FilterItemDto(752, "defloration"),
+                FilterItemDto(12053, "dilf"),
+                FilterItemDto(1581, "glasses"),
+                FilterItemDto(5440, "shotacon"),
+                FilterItemDto(10328, "aunt"),
+                FilterItemDto(2496, "milf"),
+                FilterItemDto(7268, "x-ray"),
+                FilterItemDto(639, "collar"),
+                FilterItemDto(80, "anal"),
+                FilterItemDto(6296, "sweating"),
+                FilterItemDto(730, "dark skin"),
+                FilterItemDto(6005, "stockings"),
+                FilterItemDto(2412, "masturbation"),
+                FilterItemDto(1094, "femdom"),
+                FilterItemDto(1836, "impregnation"),
+                FilterItemDto(1033, "exhibitionism"),
+            ),
+            artists = listOf(
+                FilterItemDto(4540, "dikk0"),
+                FilterItemDto(45077, "kanamirubon"),
+                FilterItemDto(40938, "shiroi yoru"),
+                FilterItemDto(42398, "osuwaani"),
+                FilterItemDto(40535, "eggutarto"),
+                FilterItemDto(41618, "a-da-ko"),
+                FilterItemDto(42749, "tanashi takashi"),
+                FilterItemDto(44770, "matsubara toori"),
+                FilterItemDto(44962, "yamashiro oki"),
+                FilterItemDto(44510, "usukuchi"),
+                FilterItemDto(45367, "m hakase"),
+                FilterItemDto(30668, "yu-ji"),
+                FilterItemDto(44096, "aoi oni"),
+                FilterItemDto(40564, "inukai mofu"),
+                FilterItemDto(45396, "gamarenji"),
+                FilterItemDto(30496, "yoshikawa hideaki"),
+                FilterItemDto(15992, "mimonel"),
+                FilterItemDto(10369, "kageusu gokuto"),
+                FilterItemDto(14645, "mahouya"),
+                FilterItemDto(4882, "ebifurya"),
+                FilterItemDto(26520, "takeda hiromitsu"),
+                FilterItemDto(27041, "tatsuya"),
+                FilterItemDto(14863, "mana"),
+                FilterItemDto(39904, "sonao"),
+                FilterItemDto(44372, "tefuru"),
+            ),
+            characters = listOf(
+                FilterItemDto(19219, "sensei"),
+                FilterItemDto(4699, "gudao"),
+                FilterItemDto(25811, "kei tendou"),
+                FilterItemDto(14871, "shirakami fubuki"),
+                FilterItemDto(12479, "producer"),
+                FilterItemDto(11195, "nami"),
+                FilterItemDto(24008, "kisaki ryuuge"),
+                FilterItemDto(21417, "wise"),
+                FilterItemDto(19410, "rio tsukatsuki"),
+                FilterItemDto(16144, "teitoku"),
+                FilterItemDto(18061, "yuuka hayase"),
+                FilterItemDto(25790, "cure arcana shadow"),
+                FilterItemDto(18654, "mika misono"),
+                FilterItemDto(11363, "naruto uzumaki"),
+                FilterItemDto(1266, "asuna ichinose"),
+                FilterItemDto(19183, "fern"),
+                FilterItemDto(5648, "hoshimachi suisei"),
+                FilterItemDto(19116, "noa ushio"),
+                FilterItemDto(5395, "hina sorasaki"),
+                FilterItemDto(24100, "nozomi tachibana"),
+                FilterItemDto(567, "alice tendou"),
+                FilterItemDto(14655, "shielder"),
+                FilterItemDto(12896, "reimu hakurei"),
+                FilterItemDto(11587, "nico robin"),
+                FilterItemDto(4056, "france"),
+            ),
+            parodies = listOf(
+                FilterItemDto(2807, "original"),
+                FilterItemDto(443, "blue archive"),
+                FilterItemDto(1584, "hololive"),
+                FilterItemDto(1069, "fate grand order"),
+                FilterItemDto(3802, "the idolmaster"),
+                FilterItemDto(2954, "pokemon"),
+                FilterItemDto(3955, "touhou project"),
+                FilterItemDto(4552, "zenless zone zero"),
+                FilterItemDto(1265, "genshin impact"),
+                FilterItemDto(2668, "nijisanji"),
+                FilterItemDto(1886, "kantai collection"),
+                FilterItemDto(231, "arknights"),
+                FilterItemDto(5260, "honkai star rail"),
+                FilterItemDto(303, "azur lane"),
+                FilterItemDto(2763, "one piece"),
+                FilterItemDto(4049, "uma musume pretty derby"),
+                FilterItemDto(2620, "naruto"),
+                FilterItemDto(2586, "my hero academia"),
+                FilterItemDto(4593, "goddess of victory nikke"),
+                FilterItemDto(5749, "meitantei precure"),
+                FilterItemDto(432, "bleach"),
+                FilterItemDto(4588, "sousou no frieren"),
+                FilterItemDto(2990, "princess connect"),
+                FilterItemDto(295, "axis powers hetalia"),
+                FilterItemDto(1784, "jujutsu kaisen"),
+            ),
+            groups = listOf(
+                FilterItemDto(29882, "seisui bar"),
+                FilterItemDto(16050, "yuujikouji"),
+                FilterItemDto(11691, "rere"),
+                FilterItemDto(22330, "misaki"),
+                FilterItemDto(32479, "muru no honbako"),
+                FilterItemDto(865, "fatalpulse"),
+                FilterItemDto(6666, "squeeze candy heaven"),
+                FilterItemDto(324, "naruho-dou"),
+                FilterItemDto(25991, "owakari itadaketa darou ka"),
+                FilterItemDto(26121, "hyoui lover"),
+                FilterItemDto(12472, "amuai okashi seisakusho"),
+                FilterItemDto(31116, "philia"),
+                FilterItemDto(125, "karakishi youhei-dan"),
+                FilterItemDto(8974, "nyuu koubou"),
+                FilterItemDto(23618, "mofumofuen"),
+                FilterItemDto(26339, "sakura no tomoru hie"),
+                FilterItemDto(5868, "marked-two"),
+                FilterItemDto(4586, "noraneko-no-tama"),
+                FilterItemDto(21501, "hokyuun"),
+                FilterItemDto(32168, "yama danchi"),
+                FilterItemDto(15584, "pecan"),
+                FilterItemDto(268, "nekomataya"),
+                FilterItemDto(31879, "line out"),
+                FilterItemDto(1074, "acid-head"),
+                FilterItemDto(26656, "seika kairaku shoten"),
+            ),
+        )
     }
 }
