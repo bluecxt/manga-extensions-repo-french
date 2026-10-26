@@ -138,20 +138,22 @@ class HentaiPaw(
         }
     }
 
-    private var inMemoryFilters: FilterOptionsDto? = null
-
     init {
+        loadCachedFilters()
         scope.launch {
-            loadCachedFilters()
             fetchPopularFiltersAsync()
         }
     }
 
     private fun loadCachedFilters() {
+        if (inMemoryFilters != null && inMemoryFilters!!.tags.isNotEmpty()) return
         try {
             val raw = globalPrefs.getString(CACHED_FILTERS_PREF, null)
             if (!raw.isNullOrBlank()) {
-                inMemoryFilters = jsonSerializer.decodeFromString<FilterOptionsDto>(raw)
+                val parsed = jsonSerializer.decodeFromString<FilterOptionsDto>(raw)
+                if (parsed.tags.isNotEmpty()) {
+                    inMemoryFilters = parsed
+                }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Error loading cached filters: ${e.message}")
@@ -204,11 +206,11 @@ class HentaiPaw(
     }
 
     private fun getFilterOptionsSafe(): FilterOptionsDto {
-        if (inMemoryFilters == null || inMemoryFilters?.tags?.isEmpty() == true) {
-            loadCachedFilters()
-        }
         val current = inMemoryFilters
-        return if (current != null && current.tags.isNotEmpty()) current else DEFAULT_FILTER_OPTIONS
+        if (current != null && current.tags.isNotEmpty()) return current
+        loadCachedFilters()
+        val loaded = inMemoryFilters
+        return if (loaded != null && loaded.tags.isNotEmpty()) loaded else DEFAULT_FILTER_OPTIONS
     }
 
     // Popular Manga
@@ -240,6 +242,17 @@ class HentaiPaw(
     // Search Manga
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         ensureConfigured()
+        val allFilters = buildList {
+            filters.forEach { filter ->
+                add(filter)
+                if (filter is Filter.Group<*>) {
+                    filter.state.forEach { child ->
+                        if (child is Filter<*>) add(child)
+                    }
+                }
+            }
+        }
+
         val url = "$baseUrl/api/manga/search".toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
 
@@ -251,23 +264,32 @@ class HentaiPaw(
             if (apiLang != null) {
                 addQueryParameter("lang", apiLang!!)
             } else {
-                val multiLang = filters.filterIsInstance<MultiLanguageFilter>().firstOrNull()
+                val multiLang = allFilters.filterIsInstance<MultiLanguageFilter>().firstOrNull()
                 val selectedLangs = multiLang?.state?.filter { it.state }?.map { it.code } ?: emptyList()
                 if (selectedLangs.isNotEmpty()) {
                     addQueryParameter("langs", selectedLangs.joinToString(","))
                 }
             }
 
-            fun extractFacet(
-                group: Filter.Group<FacetCheckBox>?,
-                includeFilter: Filter.Text?,
-                excludeFilter: Filter.Text?,
+            fun <C : FacetCheckBox, I : Filter.Text, E : Filter.Text> extractFacet(
+                checkboxClass: Class<C>,
+                includeClass: Class<I>,
+                excludeClass: Class<E>,
                 incParam: String,
                 excParam: String,
             ) {
-                val checkedIds = group?.state?.filter { it.state }?.map { it.id.toString() } ?: emptyList()
-                val textInc = includeFilter?.state?.trim().orEmpty()
-                val textExc = excludeFilter?.state?.trim().orEmpty()
+                val checkedIds = allFilters.filter { checkboxClass.isInstance(it) }
+                    .map { it as FacetCheckBox }
+                    .filter { it.state }
+                    .map { it.id.toString() }
+
+                val textInc = allFilters.filter { includeClass.isInstance(it) }
+                    .map { (it as Filter.Text).state.trim() }
+                    .firstOrNull().orEmpty()
+
+                val textExc = allFilters.filter { excludeClass.isInstance(it) }
+                    .map { (it as Filter.Text).state.trim() }
+                    .firstOrNull().orEmpty()
 
                 val includes = mutableListOf<String>()
                 includes.addAll(checkedIds)
@@ -286,55 +308,21 @@ class HentaiPaw(
                 }
             }
 
-            extractFacet(
-                filters.filterIsInstance<TagGroup>().firstOrNull(),
-                filters.filterIsInstance<TagIncludeFilter>().firstOrNull(),
-                filters.filterIsInstance<TagExcludeFilter>().firstOrNull(),
-                "tag",
-                "exclude_tag",
-            )
+            extractFacet(TagCheckBox::class.java, TagIncludeFilter::class.java, TagExcludeFilter::class.java, "tag", "exclude_tag")
+            extractFacet(ArtistCheckBox::class.java, ArtistIncludeFilter::class.java, ArtistExcludeFilter::class.java, "artist", "exclude_artist")
+            extractFacet(CharacterCheckBox::class.java, CharacterIncludeFilter::class.java, CharacterExcludeFilter::class.java, "character", "exclude_character")
+            extractFacet(ParodyCheckBox::class.java, ParodyIncludeFilter::class.java, ParodyExcludeFilter::class.java, "parody", "exclude_parody")
+            extractFacet(GroupCheckBox::class.java, GroupIncludeFilter::class.java, GroupExcludeFilter::class.java, "group", "exclude_group")
 
-            extractFacet(
-                filters.filterIsInstance<ArtistGroup>().firstOrNull(),
-                filters.filterIsInstance<ArtistIncludeFilter>().firstOrNull(),
-                filters.filterIsInstance<ArtistExcludeFilter>().firstOrNull(),
-                "artist",
-                "exclude_artist",
-            )
-
-            extractFacet(
-                filters.filterIsInstance<CharacterGroup>().firstOrNull(),
-                filters.filterIsInstance<CharacterIncludeFilter>().firstOrNull(),
-                filters.filterIsInstance<CharacterExcludeFilter>().firstOrNull(),
-                "character",
-                "exclude_character",
-            )
-
-            extractFacet(
-                filters.filterIsInstance<ParodyGroup>().firstOrNull(),
-                filters.filterIsInstance<ParodyIncludeFilter>().firstOrNull(),
-                filters.filterIsInstance<ParodyExcludeFilter>().firstOrNull(),
-                "parody",
-                "exclude_parody",
-            )
-
-            extractFacet(
-                filters.filterIsInstance<CircleGroup>().firstOrNull(),
-                filters.filterIsInstance<GroupIncludeFilter>().firstOrNull(),
-                filters.filterIsInstance<GroupExcludeFilter>().firstOrNull(),
-                "group",
-                "exclude_group",
-            )
-
-            filters.filterIsInstance<MinPagesFilter>().firstOrNull()?.state?.trim()?.toIntOrNull()?.let {
+            allFilters.filterIsInstance<MinPagesFilter>().firstOrNull()?.state?.trim()?.toIntOrNull()?.let {
                 addQueryParameter("min_pages", it.toString())
             }
-            filters.filterIsInstance<MaxPagesFilter>().firstOrNull()?.state?.trim()?.toIntOrNull()?.let {
+            allFilters.filterIsInstance<MaxPagesFilter>().firstOrNull()?.state?.trim()?.toIntOrNull()?.let {
                 addQueryParameter("max_pages", it.toString())
             }
 
             // Sorting
-            filters.filterIsInstance<SortFilter>().firstOrNull()?.selectedSort?.let {
+            allFilters.filterIsInstance<SortFilter>().firstOrNull()?.selectedSort?.let {
                 if (it.isNotEmpty()) addQueryParameter("sort", it)
             }
         }.build()
@@ -414,74 +402,88 @@ class HentaiPaw(
         filters.add(SortFilter())
 
         // 3. Pages
-        filters.add(Filter.Header("Pages"))
-        filters.add(MinPagesFilter())
-        filters.add(MaxPagesFilter())
+        filters.add(PageFoldable())
 
         // 4. Tags
-        filters.add(Filter.Header("Tags"))
-        filters.add(TagGroup(opts.tags))
-        filters.add(TagIncludeFilter())
-        filters.add(TagExcludeFilter())
+        filters.add(TagFoldable(opts.tags))
 
         // 5. Artistes
-        filters.add(Filter.Header("Artistes"))
-        filters.add(ArtistGroup(opts.artists))
-        filters.add(ArtistIncludeFilter())
-        filters.add(ArtistExcludeFilter())
+        filters.add(ArtistFoldable(opts.artists))
 
         // 6. Personnages
-        filters.add(Filter.Header("Personnages"))
-        filters.add(CharacterGroup(opts.characters))
-        filters.add(CharacterIncludeFilter())
-        filters.add(CharacterExcludeFilter())
+        filters.add(CharacterFoldable(opts.characters))
 
         // 7. Parodies
-        filters.add(Filter.Header("Parodies"))
-        filters.add(ParodyGroup(opts.parodies))
-        filters.add(ParodyIncludeFilter())
-        filters.add(ParodyExcludeFilter())
+        filters.add(ParodyFoldable(opts.parodies))
 
         // 8. Groupes
-        filters.add(Filter.Header("Groupes"))
-        filters.add(CircleGroup(opts.groups))
-        filters.add(GroupIncludeFilter())
-        filters.add(GroupExcludeFilter())
+        filters.add(GroupFoldable(opts.groups))
 
         return FilterList(filters)
     }
 
     // Filter Models
-    class FacetCheckBox(name: String, val id: Int) : Filter.CheckBox(name)
+    open class FoldableFilter(name: String, filters: List<Filter<*>>) : Filter.Group<Filter<*>>(name, filters)
+    open class FacetCheckBox(name: String, val id: Int) : Filter.CheckBox(name)
 
     // Tags
-    class TagGroup(tags: List<FilterItemDto>) : Filter.Group<FacetCheckBox>("Tags populaires", tags.map { FacetCheckBox(it.name, it.id) })
-    class TagIncludeFilter : Filter.Text("Autre tag ou ID (+)")
+    class TagCheckBox(name: String, id: Int) : FacetCheckBox(name, id)
+    class TagIncludeFilter : Filter.Text("Inclure tag (+)")
     class TagExcludeFilter : Filter.Text("Exclure tag (-)")
+    class TagFoldable(tags: List<FilterItemDto>) :
+        FoldableFilter(
+            "Tags",
+            tags.map { TagCheckBox(it.name, it.id) } + listOf(TagIncludeFilter(), TagExcludeFilter()),
+        )
 
     // Artistes
-    class ArtistGroup(artists: List<FilterItemDto>) : Filter.Group<FacetCheckBox>("Artistes populaires", artists.map { FacetCheckBox(it.name, it.id) })
-    class ArtistIncludeFilter : Filter.Text("Autre artiste ou ID (+)")
+    class ArtistCheckBox(name: String, id: Int) : FacetCheckBox(name, id)
+    class ArtistIncludeFilter : Filter.Text("Inclure artiste (+)")
     class ArtistExcludeFilter : Filter.Text("Exclure artiste (-)")
+    class ArtistFoldable(artists: List<FilterItemDto>) :
+        FoldableFilter(
+            "Artistes",
+            artists.map { ArtistCheckBox(it.name, it.id) } + listOf(ArtistIncludeFilter(), ArtistExcludeFilter()),
+        )
 
     // Personnages
-    class CharacterGroup(characters: List<FilterItemDto>) : Filter.Group<FacetCheckBox>("Personnages populaires", characters.map { FacetCheckBox(it.name, it.id) })
-    class CharacterIncludeFilter : Filter.Text("Autre personnage ou ID (+)")
+    class CharacterCheckBox(name: String, id: Int) : FacetCheckBox(name, id)
+    class CharacterIncludeFilter : Filter.Text("Inclure personnage (+)")
     class CharacterExcludeFilter : Filter.Text("Exclure personnage (-)")
+    class CharacterFoldable(characters: List<FilterItemDto>) :
+        FoldableFilter(
+            "Personnages",
+            characters.map { CharacterCheckBox(it.name, it.id) } + listOf(CharacterIncludeFilter(), CharacterExcludeFilter()),
+        )
 
     // Parodies
-    class ParodyGroup(parodies: List<FilterItemDto>) : Filter.Group<FacetCheckBox>("Parodies populaires", parodies.map { FacetCheckBox(it.name, it.id) })
-    class ParodyIncludeFilter : Filter.Text("Autre parodie ou ID (+)")
+    class ParodyCheckBox(name: String, id: Int) : FacetCheckBox(name, id)
+    class ParodyIncludeFilter : Filter.Text("Inclure parodie (+)")
     class ParodyExcludeFilter : Filter.Text("Exclure parodie (-)")
+    class ParodyFoldable(parodies: List<FilterItemDto>) :
+        FoldableFilter(
+            "Parodies",
+            parodies.map { ParodyCheckBox(it.name, it.id) } + listOf(ParodyIncludeFilter(), ParodyExcludeFilter()),
+        )
 
     // Groupes
-    class CircleGroup(groups: List<FilterItemDto>) : Filter.Group<FacetCheckBox>("Groupes populaires", groups.map { FacetCheckBox(it.name, it.id) })
-    class GroupIncludeFilter : Filter.Text("Autre groupe ou ID (+)")
+    class GroupCheckBox(name: String, id: Int) : FacetCheckBox(name, id)
+    class GroupIncludeFilter : Filter.Text("Inclure groupe (+)")
     class GroupExcludeFilter : Filter.Text("Exclure groupe (-)")
+    class GroupFoldable(groups: List<FilterItemDto>) :
+        FoldableFilter(
+            "Groupes",
+            groups.map { GroupCheckBox(it.name, it.id) } + listOf(GroupIncludeFilter(), GroupExcludeFilter()),
+        )
 
     // Pages
-    class MinPagesFilter : Filter.Text("Pages minimum")
-    class MaxPagesFilter : Filter.Text("Pages maximum")
+    class MinPagesFilter : Filter.Text("Minimum")
+    class MaxPagesFilter : Filter.Text("Maximum")
+    class PageFoldable :
+        FoldableFilter(
+            "Pages",
+            listOf(MinPagesFilter(), MaxPagesFilter()),
+        )
 
     class LanguageCheckBox(name: String, val code: String) : Filter.CheckBox(name)
 
@@ -560,6 +562,9 @@ class HentaiPaw(
         private const val API_SECRET_PREF = "paw_api_secret"
         private const val CACHED_FILTERS_PREF = "hentaipaw_cached_filters_json"
         private const val FILTERS_LAST_FETCH_PREF = "hentaipaw_filters_last_fetch"
+
+        @Volatile
+        private var inMemoryFilters: FilterOptionsDto? = null
 
         private val DEFAULT_FILTER_OPTIONS = FilterOptionsDto(
             tags = listOf(
