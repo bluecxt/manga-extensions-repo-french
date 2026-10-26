@@ -18,6 +18,7 @@ import keiyoushi.source.KeiSource
 import keiyoushi.utils.applicationContext
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonElement
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -127,28 +128,86 @@ class HentaiPaw(
         return this
     }
 
-    private val filterOptions: FilterOptionsDto by lazy {
+    private val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO + kotlinx.coroutines.SupervisorJob())
+
+    private val jsonSerializer by lazy {
+        kotlinx.serialization.json.Json {
+            ignoreUnknownKeys = true
+            isLenient = true
+            encodeDefaults = true
+        }
+    }
+
+    private var inMemoryFilters: FilterOptionsDto? = null
+
+    init {
+        scope.launch {
+            loadCachedFilters()
+            fetchPopularFiltersAsync()
+        }
+    }
+
+    private fun loadCachedFilters() {
         try {
-            val url = apiUrl
-            if (url.isBlank()) return@lazy FilterOptionsDto()
-            val secret = apiSecret
+            val raw = globalPrefs.getString(CACHED_FILTERS_PREF, null)
+            if (!raw.isNullOrBlank()) {
+                inMemoryFilters = jsonSerializer.decodeFromString<FilterOptionsDto>(raw)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error loading cached filters: ${e.message}")
+        }
+    }
+
+    private fun fetchPopularFiltersAsync(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        val lastFetch = globalPrefs.getLong(FILTERS_LAST_FETCH_PREF, 0L)
+        if (!force && inMemoryFilters != null && inMemoryFilters!!.tags.isNotEmpty() && (now - lastFetch) < 24 * 60 * 60 * 1000L) {
+            return
+        }
+
+        val url = apiUrl
+        if (url.isBlank()) return
+        val secret = apiSecret
+
+        try {
             val req = okhttp3.Request.Builder()
-                .url("$url/api/manga/filters")
-                .header("X-Paw-Secret", secret)
-                .header("Authorization", "Bearer $secret")
+                .url("$url/api/manga/filters/popular?limit=25")
+                .apply {
+                    if (secret.isNotBlank()) {
+                        header("X-Paw-Secret", secret)
+                        header("Authorization", "Bearer $secret")
+                    }
+                }
                 .build()
 
             client.newCall(req).execute().use { resp ->
                 if (resp.isSuccessful) {
-                    resp.parseAs<FilterOptionsDto>()
+                    val body = resp.body.string()
+                    if (body.isNotBlank()) {
+                        val parsed = jsonSerializer.decodeFromString<FilterOptionsDto>(body)
+                        if (parsed.tags.isNotEmpty()) {
+                            inMemoryFilters = parsed
+                            globalPrefs.edit()
+                                .putString(CACHED_FILTERS_PREF, body)
+                                .putLong(FILTERS_LAST_FETCH_PREF, now)
+                                .apply()
+                            Log.d(TAG, "[$lang] Popular filters cache updated (tags=${parsed.tags.size})")
+                        }
+                    }
                 } else {
-                    FilterOptionsDto()
+                    Log.w(TAG, "[$lang] Popular filters fetch HTTP ${resp.code}")
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to load filter options: ${e.message}")
-            FilterOptionsDto()
+            Log.w(TAG, "Failed to refresh popular filters in background: ${e.message}")
         }
+    }
+
+    private fun getFilterOptionsSafe(): FilterOptionsDto {
+        if (inMemoryFilters == null || inMemoryFilters?.tags?.isEmpty() == true) {
+            loadCachedFilters()
+        }
+        return inMemoryFilters ?: FilterOptionsDto()
     }
 
     // Popular Manga
@@ -183,31 +242,69 @@ class HentaiPaw(
         val url = "$baseUrl/api/manga/search".toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
 
-            val targetLang = apiLang ?: filters.filterIsInstance<LanguageFilter>().firstOrNull()?.selected
-            if (!targetLang.isNullOrEmpty()) {
-                addQueryParameter("lang", targetLang)
+            if (query.isNotBlank()) {
+                addQueryParameter("q", query.trim())
             }
 
-            filters.filterIsInstance<TagFilter>().firstOrNull()?.selectedId?.let {
-                addQueryParameter("tagId", it.toString())
+            // Language filtering
+            if (apiLang != null) {
+                addQueryParameter("lang", apiLang!!)
+            } else {
+                val multiLang = filters.filterIsInstance<MultiLanguageFilter>().firstOrNull()
+                val selectedLangs = multiLang?.state?.filter { it.state }?.map { it.code } ?: emptyList()
+                if (selectedLangs.isNotEmpty()) {
+                    addQueryParameter("langs", selectedLangs.joinToString(","))
+                }
             }
-            filters.filterIsInstance<ArtistFilter>().firstOrNull()?.selectedId?.let {
-                addQueryParameter("artistId", it.toString())
+
+            // Helper to extract checkbox IDs and text includes/excludes from a Group<Filter<*>>
+            fun extractFacetGroup(group: Filter.Group<Filter<*>>?, includeParam: String, excludeParam: String) {
+                if (group == null) return
+                val checkedIds = group.state.filterIsInstance<FacetCheckBox>().filter { it.state }.map { it.id.toString() }
+                val textInclude = group.state.filterIsInstance<TextIncludeFilter>().firstOrNull()?.state?.trim().orEmpty()
+                val textExclude = group.state.filterIsInstance<TextExcludeFilter>().firstOrNull()?.state?.trim().orEmpty()
+
+                val includes = mutableListOf<String>()
+                includes.addAll(checkedIds)
+                if (textInclude.isNotEmpty()) {
+                    textInclude.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { includes.add(it) }
+                }
+                if (includes.isNotEmpty()) {
+                    addQueryParameter(includeParam, includes.joinToString(","))
+                }
+
+                if (textExclude.isNotEmpty()) {
+                    val excludes = textExclude.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                    if (excludes.isNotEmpty()) {
+                        addQueryParameter(excludeParam, excludes.joinToString(","))
+                    }
+                }
             }
-            filters.filterIsInstance<CharacterFilter>().firstOrNull()?.selectedId?.let {
-                addQueryParameter("characterId", it.toString())
+
+            extractFacetGroup(filters.filterIsInstance<TagFilterGroup>().firstOrNull(), "tag", "exclude_tag")
+            extractFacetGroup(filters.filterIsInstance<ArtistFilterGroup>().firstOrNull(), "artist", "exclude_artist")
+            extractFacetGroup(filters.filterIsInstance<CharacterFilterGroup>().firstOrNull(), "character", "exclude_character")
+            extractFacetGroup(filters.filterIsInstance<ParodyFilterGroup>().firstOrNull(), "parody", "exclude_parody")
+            extractFacetGroup(filters.filterIsInstance<GroupFilterGroup>().firstOrNull(), "group", "exclude_group")
+
+            // Pages count filters inside PagesFilterGroup
+            val pagesGroup = filters.filterIsInstance<PagesFilterGroup>().firstOrNull()
+            pagesGroup?.state?.filterIsInstance<MinPagesFilter>()?.firstOrNull()?.state?.trim()?.toIntOrNull()?.let {
+                addQueryParameter("min_pages", it.toString())
             }
-            filters.filterIsInstance<ParodyFilter>().firstOrNull()?.selectedId?.let {
-                addQueryParameter("parodyId", it.toString())
+            pagesGroup?.state?.filterIsInstance<MaxPagesFilter>()?.firstOrNull()?.state?.trim()?.toIntOrNull()?.let {
+                addQueryParameter("max_pages", it.toString())
             }
-            filters.filterIsInstance<GroupFilter>().firstOrNull()?.selectedId?.let {
-                addQueryParameter("groupId", it.toString())
+
+            // Sorting
+            filters.filterIsInstance<SortFilter>().firstOrNull()?.selectedSort?.let {
+                if (it.isNotEmpty()) addQueryParameter("sort", it)
             }
         }.build()
 
         val dto = client.get(url.toString()).parseAs<MangaListPageDto>()
         if (dto.mangas.isEmpty() && lang == "fr") {
-            throw Exception("Aucune œuvre en français disponible sur HentaiPaw (le catalogue propose : Anglais, Japonais, Chinois, Espagnol). Veuillez utiliser la source HentaiPaw (en) ou HentaiPaw (all).")
+            throw Exception("Aucune œuvre en français disponible sur HentaiPaw. Veuillez utiliser la source HentaiPaw (en) ou HentaiPaw (all).")
         }
         return MangasPage(dto.mangas.map { it.toSManga() }, dto.hasNextPage)
     }
@@ -262,64 +359,126 @@ class HentaiPaw(
         return pages.map { Page(it.index, "", it.imageUrl) }
     }
 
-    // Filters
+    // Filters UI
     override fun getFilterList(data: JsonElement?): FilterList {
-        val filters = mutableListOf<Filter<*>>()
-        val opts = filterOptions
+        val opts = getFilterOptionsSafe()
+        if (opts.tags.isEmpty()) {
+            scope.launch { fetchPopularFiltersAsync(force = true) }
+        }
 
+        val filters = mutableListOf<Filter<*>>()
+
+        // 1. Langues (source 'all' uniquement)
         if (lang == "all") {
-            filters.add(LanguageFilter())
+            filters.add(MultiLanguageFilter())
         }
-        if (opts.tags.isNotEmpty()) {
-            filters.add(TagFilter(opts.tags))
-        }
-        if (opts.artists.isNotEmpty()) {
-            filters.add(ArtistFilter(opts.artists))
-        }
-        if (opts.characters.isNotEmpty()) {
-            filters.add(CharacterFilter(opts.characters))
-        }
-        if (opts.parodies.isNotEmpty()) {
-            filters.add(ParodyFilter(opts.parodies))
-        }
-        if (opts.groups.isNotEmpty()) {
-            filters.add(GroupFilter(opts.groups))
-        }
+
+        // 2. Tri
+        filters.add(SortFilter())
+
+        // 3. Pages (catégorie pliable)
+        filters.add(PagesFilterGroup())
+
+        // 4. Catégories taxonomiques (titres épurés)
+        filters.add(TagFilterGroup(opts.tags))
+        filters.add(ArtistFilterGroup(opts.artists))
+        filters.add(CharacterFilterGroup(opts.characters))
+        filters.add(ParodyFilterGroup(opts.parodies))
+        filters.add(GroupFilterGroup(opts.groups))
 
         return FilterList(filters)
     }
 
-    abstract class SelectFilter(name: String, private val items: List<FilterItemDto>) : Filter.Select<String>(name, (listOf("Tous") + items.map { it.name }).toTypedArray()) {
-        val selectedId: Int?
-            get() = if (state > 0 && state <= items.size) items[state - 1].id else null
-    }
+    // Filter Models
+    class FacetCheckBox(name: String, val id: Int) : Filter.CheckBox(name)
+    class TextIncludeFilter(name: String) : Filter.Text(name)
+    class TextExcludeFilter(name: String) : Filter.Text(name)
 
-    class TagFilter(items: List<FilterItemDto>) : SelectFilter("Tag", items)
-    class ArtistFilter(items: List<FilterItemDto>) : SelectFilter("Artiste", items)
-    class CharacterFilter(items: List<FilterItemDto>) : SelectFilter("Personnage", items)
-    class ParodyFilter(items: List<FilterItemDto>) : SelectFilter("Parodie", items)
-    class GroupFilter(items: List<FilterItemDto>) : SelectFilter("Cercle / Groupe", items)
+    class TagFilterGroup(tags: List<FilterItemDto>) :
+        Filter.Group<Filter<*>>(
+            "Tags",
+            tags.map { FacetCheckBox(it.name, it.id) } + listOf(
+                TextIncludeFilter("Autre tag ou ID (+)"),
+                TextExcludeFilter("Exclure tag (-)"),
+            ),
+        )
 
-    private class LanguageFilter :
-        Filter.Select<String>(
-            "Langue",
-            LANGUAGES.map { it.first }.toTypedArray(),
+    class ArtistFilterGroup(artists: List<FilterItemDto>) :
+        Filter.Group<Filter<*>>(
+            "Artistes",
+            artists.map { FacetCheckBox(it.name, it.id) } + listOf(
+                TextIncludeFilter("Autre artiste ou ID (+)"),
+                TextExcludeFilter("Exclure artiste (-)"),
+            ),
+        )
+
+    class CharacterFilterGroup(characters: List<FilterItemDto>) :
+        Filter.Group<Filter<*>>(
+            "Personnages",
+            characters.map { FacetCheckBox(it.name, it.id) } + listOf(
+                TextIncludeFilter("Autre personnage ou ID (+)"),
+                TextExcludeFilter("Exclure personnage (-)"),
+            ),
+        )
+
+    class ParodyFilterGroup(parodies: List<FilterItemDto>) :
+        Filter.Group<Filter<*>>(
+            "Parodies",
+            parodies.map { FacetCheckBox(it.name, it.id) } + listOf(
+                TextIncludeFilter("Autre parodie ou ID (+)"),
+                TextExcludeFilter("Exclure parodie (-)"),
+            ),
+        )
+
+    class GroupFilterGroup(groups: List<FilterItemDto>) :
+        Filter.Group<Filter<*>>(
+            "Groupes",
+            groups.map { FacetCheckBox(it.name, it.id) } + listOf(
+                TextIncludeFilter("Autre groupe ou ID (+)"),
+                TextExcludeFilter("Exclure groupe (-)"),
+            ),
+        )
+
+    class MinPagesFilter : Filter.Text("Pages minimum")
+    class MaxPagesFilter : Filter.Text("Pages maximum")
+
+    class PagesFilterGroup :
+        Filter.Group<Filter.Text>(
+            "Pages",
+            listOf(MinPagesFilter(), MaxPagesFilter()),
+        )
+
+    class LanguageCheckBox(name: String, val code: String) : Filter.CheckBox(name)
+
+    class MultiLanguageFilter :
+        Filter.Group<LanguageCheckBox>(
+            "Langues",
+            LANGUAGES.map { LanguageCheckBox(it.first, it.second) },
         ) {
-        val selected: String
-            get() = LANGUAGES[state].second
-
         companion object {
             private val LANGUAGES = listOf(
-                Pair("Toutes", ""),
-                Pair("Anglais", "us"),
-                Pair("Français", "fr"),
-                Pair("Japonais", "jp"),
-                Pair("Chinois", "cn"),
-                Pair("Espagnol", "es"),
-                Pair("Coréen", "kr"),
-                Pair("Portugais", "pt"),
+                Pair("Français (FR)", "fr"),
+                Pair("Anglais (US)", "us"),
+                Pair("Japonais (JP)", "jp"),
+                Pair("Chinois (CN)", "cn"),
+                Pair("Espagnol (ES)", "es"),
+                Pair("Coréen (KR)", "kr"),
+                Pair("Portugais (PT)", "pt"),
             )
         }
+    }
+
+    class SortFilter :
+        Filter.Select<String>(
+            "Trier par",
+            arrayOf("Derniers ajouts", "Popularité", "Nombre de pages"),
+        ) {
+        val selectedSort: String
+            get() = when (state) {
+                1 -> "popular"
+                2 -> "pages"
+                else -> ""
+            }
     }
 
     // Preferences
@@ -364,5 +523,7 @@ class HentaiPaw(
         private const val TAG = "HentaiPaw"
         private const val API_URL_PREF = "paw_api_url"
         private const val API_SECRET_PREF = "paw_api_secret"
+        private const val CACHED_FILTERS_PREF = "hentaipaw_cached_filters_json"
+        private const val FILTERS_LAST_FETCH_PREF = "hentaipaw_filters_last_fetch"
     }
 }
