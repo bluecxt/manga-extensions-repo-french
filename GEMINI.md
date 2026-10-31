@@ -54,6 +54,7 @@ Les dépôts parents configurés :
     - `src/all/` : `hentai3` (retrait des sources `fi`/`mo`, `versionCode = 6`), `mangafire` (filtrage par langue de la source), `pandachaika` (fix crash uploader null, retrait des langues vides).
   - **Nettoyage :**
     - `src/all/manga18me` : suppression du `Filters.kt` orphelin (l'extension est passée au thème `yiimadara`, qui fournit ses propres filtres) — aligne l'arbre sur l'upstream.
+    - `src/fr/scansfr` et `src/fr/kiwiyascans` : **supprimées** (déjà retirées des upstreams, sites morts — `scansfr.com` refondu en Next.js sans l'API `api.scansfr.com/api/v1`, `kiwiyascans.com` en erreur Cloudflare 526). Ne pas les restaurer.
   - **Outillage de build :** Gradle wrapper `9.7.1 → 9.8.2`, AGP `9.3.2 → 9.4.1` (`gradle/libs.versions.toml`). `gradle-daemon-jvm.properties` (toolchain 21) et le build-logic Kotlin DSL locaux conservés.
   - **Extensions custom préservées (non écrasées) :** `src/fr/japscan`, `src/all/niadd`, `src/all/mangadex` (BLC), `src/all/mangaball` (BLC), `src/all/hentaipaw`.
   - `cursed` (`main`) : `src/all/nhentai`, `ehentai`, `hitomi`, `pururin` déjà conformes.
