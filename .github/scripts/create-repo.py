@@ -122,6 +122,11 @@ for apk in sorted(REPO_APK_DIR.glob("*.apk")):
     code = int(version_code_match[1]) if version_code_match else 0
     version_name_match = VERSION_NAME_REGEX.search(package_info)
     version = version_name_match[1] if version_name_match else "1.0"
+    # Ensure version string has at most two dots (libVersion.patch) for Tachiyomi/Mihon/Komikku legacy store compatibility
+    # NetworkLegacyExtension: libVersion = version.substringBeforeLast('.').toDouble()
+    parts = version.split(".")
+    if len(parts) > 3:
+        version = f"{parts[0]}.{parts[1]}.{parts[-1]}"
     nsfw_match = IS_NSFW_REGEX.search(badging)
     nsfw = int(nsfw_match[1]) if nsfw_match else 0
 
