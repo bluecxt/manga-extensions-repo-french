@@ -52,6 +52,7 @@ Les dépôts parents configurés :
     - `src/fr/` : `astralmanga` (`versionCode = 1`), `fmteam` (ouverture des séries sous `/manga/` en WebView), `ortegascans` (`versionCode = 4`), `scanhentaimenu` (refonte X-Manga : `Dto.kt` + `Filters.kt` ajoutés), `toonfr` (parsing des dates de chapitres).
     - `src/en/` : `mangakakalot` (domaine `www.kakamanga.com`, `versionCode = 10`).
     - `src/all/` : `hentai3` (retrait des sources `fi`/`mo`, `versionCode = 6`), `mangafire` (filtrage par langue de la source), `pandachaika` (fix crash uploader null, retrait des langues vides).
+  - **Extensions FR ajoutées depuis `yuzono/main` :** `scanreader` (thème `scanreader`, `https://scanreader.net`), `hentaiscanreader` (même thème, NSFW, `https://hentai.scanreader.net`), `aniverse` (`https://aniverse.fr`), `bdplus` (`https://bdplus.cc`), `mabrute` (thème `madara`, NSFW, `https://mabrute.com`), `scanmanga` (`https://m.scan-manga.com`, retirée de `exclude_build.json`). Validation : `compileDebugKotlin` OK sur les 6 modules.
   - **Nettoyage :**
     - `src/all/manga18me` : suppression du `Filters.kt` orphelin (l'extension est passée au thème `yiimadara`, qui fournit ses propres filtres) — aligne l'arbre sur l'upstream.
     - `src/fr/scansfr` et `src/fr/kiwiyascans` : **supprimées** (déjà retirées des upstreams, sites morts — `scansfr.com` refondu en Next.js sans l'API `api.scansfr.com/api/v1`, `kiwiyascans.com` en erreur Cloudflare 526). Ne pas les restaurer.
