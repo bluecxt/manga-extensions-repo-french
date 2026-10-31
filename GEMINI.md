@@ -97,11 +97,7 @@ git restore --source=yuzono/main -- src/fr/nouvelle_extension
   - Parsing étendu du numéro de chapitre (`CHAPTER_NUMBER_REGEX` gérant Vol/Volume, Ch/Chapitre, Capitulo).
   - Tri automatique descendant par `chapter_number` dans `chapterListParse` pour corriger les chapitres mal ordonnés sur le site.
   - **Ne pas écraser aveuglément depuis `upstream`** sans préserver ces correctifs de tri et parsing.
-- **`src/all/hentaipaw`** : Extension custom du fork, **absente de l'upstream** (`yuzono`/`cursed`) — elle n'existe qu'ici, ne jamais la supprimer lors d'une synchro :
-  - Filtres hiérarchiques repliables (cartes « foldable ») avec groupes homogènes et titres lisibles, construits dynamiquement depuis l'API des filtres du site.
-  - Cache mémoire partagé des filtres populaires (`loadCachedFilters`, endpoint `/api/manga/filters/popular?limit=25`) avec défauts « popular » instantanés à l'ouverture de l'écran de recherche.
-  - Filtres multi-langues + catégories include/exclude/pages, DTO dédié (`HentaiPawDto.kt`).
-  - État actuel : `versionCode = 6`, `libVersion = 1.6`.
+- **`src/all/hentaipaw`** : Extension custom du fork, **absente de l'upstream** (`yuzono`/`cursed`) — elle n'existe qu'ici, ne jamais la supprimer lors d'une synchro
 - **`src/all/mangadex`** : Correctifs fork marqués `// BLC -->` / `// BLC <--` :
   - Ajout d'une préférence `hasAvailableChapters` par langue (`MDConstants.getHasAvailableChaptersPrefKey`) et du `HasAvailableChaptersFilter` correspondant (état initial repris des préférences).
   - `versionCode = 1` (`// upstream: 0`).
