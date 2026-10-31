@@ -255,6 +255,13 @@ def main() -> NoReturn:
     # Filter modules based on exclude_build.json
     modules = filter_modules(modules)
 
+    # Deterministic ordering: the module list comes from Python sets, whose
+    # iteration order depends on the randomized string hash seed. Without this,
+    # every run produces different chunks, which changes the Gradle task list
+    # and defeats the configuration cache (and any per-chunk cache).
+    modules = sorted(modules)
+    deleted = sorted(deleted)
+
     # Calculate balanced chunk size
     total_modules = len(modules)
     chunk_size_limit = int(os.getenv("CI_CHUNK_SIZE", 65))
