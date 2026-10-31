@@ -321,9 +321,17 @@ class HentaiPaw(
                 addQueryParameter("max_pages", it.toString())
             }
 
-            // Sorting
-            allFilters.filterIsInstance<SortFilter>().firstOrNull()?.selectedSort?.let {
-                if (it.isNotEmpty()) addQueryParameter("sort", it)
+            // Sorting & Seed
+            val sortFilter = allFilters.filterIsInstance<SortFilter>().firstOrNull()
+            val sort = sortFilter?.selectedSort.orEmpty()
+            if (sort.isNotEmpty()) {
+                addQueryParameter("sort", sort)
+                if (sort == "random") {
+                    if (page == 1) {
+                        currentSearchSeed = (System.currentTimeMillis() xor kotlin.random.Random.nextLong()) and 0x7FFFFFFF
+                    }
+                    addQueryParameter("seed", currentSearchSeed.toString())
+                }
             }
         }.build()
 
@@ -508,12 +516,13 @@ class HentaiPaw(
     class SortFilter :
         Filter.Select<String>(
             "Trier par",
-            arrayOf("Derniers ajouts", "Popularité", "Nombre de pages"),
+            arrayOf("Derniers ajouts", "Popularité", "Nombre de pages", "Aléatoire"),
         ) {
         val selectedSort: String
             get() = when (state) {
                 1 -> "popular"
                 2 -> "pages"
+                3 -> "random"
                 else -> ""
             }
     }
@@ -565,6 +574,9 @@ class HentaiPaw(
 
         @Volatile
         private var inMemoryFilters: FilterOptionsDto? = null
+
+        @Volatile
+        private var currentSearchSeed: Long = 12345L
 
         private val DEFAULT_FILTER_OPTIONS = FilterOptionsDto(
             tags = listOf(
