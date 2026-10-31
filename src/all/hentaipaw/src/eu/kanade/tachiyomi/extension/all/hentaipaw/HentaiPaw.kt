@@ -77,6 +77,14 @@ class HentaiPaw(
         get() = when (lang) {
             "en" -> "us"
             "fr" -> "fr"
+            "ja" -> "jp"
+            "zh" -> "cn"
+            "es" -> "es"
+            "ko" -> "kr"
+            "pt" -> "pt"
+            "ru" -> "ru"
+            "it" -> "it"
+            "de" -> "de"
             else -> null
         }
 
@@ -499,13 +507,16 @@ class HentaiPaw(
         ) {
         companion object {
             private val LANGUAGES = listOf(
-                Pair("French (FR)", "fr"),
                 Pair("English (US)", "us"),
                 Pair("Japanese (JP)", "jp"),
+                Pair("French (FR)", "fr"),
                 Pair("Chinese (CN)", "cn"),
                 Pair("Spanish (ES)", "es"),
                 Pair("Korean (KR)", "kr"),
                 Pair("Portuguese (PT)", "pt"),
+                Pair("Russian (RU)", "ru"),
+                Pair("Italian (IT)", "it"),
+                Pair("German (DE)", "de"),
             )
         }
     }

@@ -6,11 +6,11 @@ plugins {
 
 keiyoushi {
     name = "HentaiPaw"
-    versionCode = 7
+    versionCode = 8
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
 
-    listOf("all", "fr", "en").forEach { sourceLang ->
+    listOf("all", "en", "fr", "ja", "zh", "es", "ko", "pt", "ru", "it", "de").forEach { sourceLang ->
         source {
             lang = sourceLang
             baseUrl = "https://hentaipaw.com"
