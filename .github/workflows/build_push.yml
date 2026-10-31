@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CI_CHUNK_SIZE: 30
+  CI_CHUNK_SIZE: 20
   IS_PR_CHECK: false
 
 jobs:
@@ -79,7 +79,7 @@ jobs:
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
-          java-version: 17
+          java-version: 21
           distribution: temurin
 
       - name: Set up Gradle
@@ -129,7 +129,7 @@ jobs:
       - name: Set up JDK
         uses: actions/setup-java@v5
         with:
-          java-version: 17
+          java-version: 21
           distribution: temurin
 
       - name: Checkout repository
