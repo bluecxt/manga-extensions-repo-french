@@ -17,7 +17,7 @@ jobs:
           fetch-depth: 0
 
       - name: Restauration de la date de dernière vérification
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .last_run
           key: last-update-check-${{ github.run_id }}
@@ -132,7 +132,7 @@ jobs:
           fi
 
       - name: Sauvegarde de la date dans le cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .last_run
           key: last-update-check-${{ github.run_id }}
