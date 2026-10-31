@@ -5,7 +5,7 @@ Ce fichier définit les règles et la structure spécifique de ce dépôt pour a
 ## Structure du Dépôt
 
 - **`src/fr/`** : Extensions uniquement en français (liste triée par l'utilisateur).
-- **`src/en/`** : Sélection des 5 sites anglais les plus réputés (`mangasee`, `mangakakalot`, `manganelo`, `mangapark`, `readcomicsonline`).
+- **`src/en/`** : Sélection de 4 sites anglais (`mangago`, `mangakakalot`, `manganelo`, `readcomicsonline`). `mangapark` n'est pas présent dans l'upstream actuel.
 - **`src/all/`** : Extensions multilingues sélectionnées (incluant MangaDex, Hitomi, nHentai, E-Hentai, etc.).
 - **`exclude_build.json`** : Fichier JSON à la racine permettant d'exclure temporairement des extensions du build GitHub Actions.
 - **`keystore/`** : (Ignoré par Git) Contient la clé de signature Android `signingkey.jks`.
@@ -38,25 +38,26 @@ L'URL du catalogue pour Mihon/Tachiyomi/Komikku est :
 
 Les dépôts parents configurés :
 - **yuzono** : `https://github.com/yuzono/tachiyomi-extensions.git` (Branche par défaut : `main` ou `keiyoushi`)
-- **cursed** : `https://github.com/yuzono/cursed-manga-extensions.git` (Branche : `master`)
+- **cursed** : `https://github.com/yuzono/cursed-manga-extensions.git` (Branche : `main` — l'ancienne branche `master` a été supprimée upstream et fusionnée dans `main`)
 
 #### Dernière Maintenance
-- **Date :** 2 Octobre 2026
+- **Date :** 31 Octobre 2026
 - **État :**
-  - Remotes `yuzono` et `cursed` synchronisés via `git fetch --all`.
-  - `core` : Synchronisé avec l'upstream (`keiyoushi.zip.coroutines`, `ProtobufDecoder/Encoder`).
-  - `lib/` : Bibliothèques `publus`, `speedbinb`, `e4p` mises à jour avec les optimisations upstream.
-  - `lib-multisrc/` : Thèmes `mangathemesia`, `fuzzydoodle`, `mmrcms`, `galleryadults`, `madara` migrés vers `libVersion = 1.6`.
-  - **Extensions mises à jour (libVersion = 1.6) :**
-    - `src/fr/` : `animesama`, `aralosbd`, `bigsolo`, `furyosquad`, `hentaiscantrad` (nouvelle URL `https://hentai-scantrad.org`), `kiwiyascans`, `lanortrad` (nouvelle structure), `lelmanga`, `lelscanvf`, `lesporoiniens`, `mangakawaii` (V5), `mangamoins`, `scanr`, `scantradunion`, `scanvf`, `sushiscan`, `sushiscanfr`.
-    - `src/en/` : `readcomicsonline` (MMRCMS 1.6 + recherche étendue).
-    - `src/all/` : `akuma`, `hennojin`, `hentaienvy`, `hentaizap`, `mangaball`, `mangadex`, `mangamillion` (réécriture protobuf et 100+ langues), `mangaplus`, `pandachaika`.
-  - **Extensions spécifiques :**
-    - `src/all/niadd` : Migrée vers `libVersion = 1.6` tout en préservant les correctifs custom (tri descendant des chapitres, `CHAPTER_NUMBER_REGEX` multi-langues, parsing `span.chp-title`), incrémentée à `versionCode = 4`.
-    - `src/fr/perfscan` : Supprimée et consignée dans `exclude_build.json` (site mort / nom de domaine inexistant upstream #19555).
-    - `src/fr/japscan` : Migrée vers `libVersion = 1.6` (`KeiSource`, coroutines, `ReaderScripts.kt`, `SearchResultDto.kt`, `warmupWebViewSession`) tout en conservant le solveur custom de challenge d'images (`ImageUtils.kt` / `orderUuidsByImageVerticality`), le solveur Cloudflare Turnstile `lib:twocaptcha`, et incrémentée à `versionCode = 72`.
-    - `cursed` (`master`) : `src/all/nhentai`, `ehentai`, `hitomi`, `pururin` synchronisés et conformes à `cursed/master`.
-  - Validation du build : `compileDebugKotlin` validé avec succès (exit code 0 sur tous les modules).
+  - Remotes synchronisés via `git fetch --all --prune`. `yuzono/main` = `853268fc7d`, `cursed/main` = `5dad5cf65d`.
+  - **Note environnement :** `origin` est en SSH (`git@cle-perso`). Dans un shell sans `ssh` au `PATH`, préfixer : `PATH=/run/current-system/sw/bin:$PATH git fetch origin`.
+  - `core` : Synchronisé avec l'upstream — `Crypto.kt` étendu (+119 lignes, +46 dans `CryptoTest.kt`), `NextJs.kt` mis à jour (assemblage des chunks Next.js flight, + `NextJsTest.kt`), suppression de `reactFlight/ReactFlightDate.kt`.
+  - `lib/` : Bibliothèques partagées déjà à jour (aucun diff). Bibliothèques fork-only conservées : `twocaptcha` (Japscan), `cryptoaes`, `seedrandom`, `zipinterceptor`, `cookieinterceptor`.
+  - `lib-multisrc/` : Synchronisé intégralement avec l'upstream. Themes mis à jour : `hiper`, `iken`, `mangahub`, `moonlighttl`, `natsuid`, `vinetheme`, `aurora`, `comiciviewer`, `eromuse`, `initmanga`, `madara`, `mangabox`, `mangak`, `pam`. Ajout du thème `imperiomanhwa` (renommage upstream de `madaralegacy`). Thèmes orphelins supprimés : `clipstudioreader` (déplacé dans `lib/` upstream, inutilisé ici), `madaralegacy`, `gigaviewer/GigaViewerDto.kt`.
+  - **Extensions resynchronisées depuis `yuzono/main` (surgical restore) :**
+    - `src/fr/` : `astralmanga` (`versionCode = 1`), `fmteam` (ouverture des séries sous `/manga/` en WebView), `ortegascans` (`versionCode = 4`), `scanhentaimenu` (refonte X-Manga : `Dto.kt` + `Filters.kt` ajoutés), `toonfr` (parsing des dates de chapitres).
+    - `src/en/` : `mangakakalot` (domaine `www.kakamanga.com`, `versionCode = 10`).
+    - `src/all/` : `hentai3` (retrait des sources `fi`/`mo`, `versionCode = 6`), `mangafire` (filtrage par langue de la source), `pandachaika` (fix crash uploader null, retrait des langues vides).
+  - **Nettoyage :**
+    - `src/all/manga18me` : suppression du `Filters.kt` orphelin (l'extension est passée au thème `yiimadara`, qui fournit ses propres filtres) — aligne l'arbre sur l'upstream.
+  - **Outillage de build :** Gradle wrapper `9.7.1 → 9.8.2`, AGP `9.3.2 → 9.4.1` (`gradle/libs.versions.toml`). `gradle-daemon-jvm.properties` (toolchain 21) et le build-logic Kotlin DSL locaux conservés.
+  - **Extensions custom préservées (non écrasées) :** `src/fr/japscan`, `src/all/niadd`, `src/all/mangadex` (BLC), `src/all/mangaball` (BLC), `src/all/hentaipaw`.
+  - `cursed` (`main`) : `src/all/nhentai`, `ehentai`, `hitomi`, `pururin` déjà conformes.
+  - Validation du build : `PATH=/run/current-system/sw/bin:$PATH ./gradlew compileDebugKotlin` → `BUILD SUCCESSFUL` (exit 0, 2137 tâches, ~3 min) avec Gradle 9.8.2 + AGP 9.4.1. Seul avertissement : `SimpleDateFormat.tryParse` déprécié dans `scansfr` (préexistant).
 
 #### Commandes Utiles
 ```bash
@@ -65,11 +66,11 @@ git fetch --all
 
 # 2. Comparer les changements avant import
 git diff main yuzono/main -- src/all/mangadex
-git diff main cursed/master -- src/all/nhentai
+git diff main cursed/main -- src/all/nhentai
 
 # 3. Mettre à jour une extension standard (Surgical Update)
 git restore --source=yuzono/main -- src/fr/mangakawaii
-git restore --source=cursed/master -- src/all/nhentai
+git restore --source=cursed/main -- src/all/nhentai
 
 # 4. Ajouter une nouvelle extension depuis un parent
 git restore --source=yuzono/main -- src/fr/nouvelle_extension
@@ -96,9 +97,22 @@ git restore --source=yuzono/main -- src/fr/nouvelle_extension
   - Parsing étendu du numéro de chapitre (`CHAPTER_NUMBER_REGEX` gérant Vol/Volume, Ch/Chapitre, Capitulo).
   - Tri automatique descendant par `chapter_number` dans `chapterListParse` pour corriger les chapitres mal ordonnés sur le site.
   - **Ne pas écraser aveuglément depuis `upstream`** sans préserver ces correctifs de tri et parsing.
+- **`src/all/hentaipaw`** : Extension custom du fork, **absente de l'upstream** (`yuzono`/`cursed`) — elle n'existe qu'ici, ne jamais la supprimer lors d'une synchro :
+  - Filtres hiérarchiques repliables (cartes « foldable ») avec groupes homogènes et titres lisibles, construits dynamiquement depuis l'API des filtres du site.
+  - Cache mémoire partagé des filtres populaires (`loadCachedFilters`, endpoint `/api/manga/filters/popular?limit=25`) avec défauts « popular » instantanés à l'ouverture de l'écran de recherche.
+  - Filtres multi-langues + catégories include/exclude/pages, DTO dédié (`HentaiPawDto.kt`).
+  - État actuel : `versionCode = 6`, `libVersion = 1.6`.
+- **`src/all/mangadex`** : Correctifs fork marqués `// BLC -->` / `// BLC <--` :
+  - Ajout d'une préférence `hasAvailableChapters` par langue (`MDConstants.getHasAvailableChaptersPrefKey`) et du `HasAvailableChaptersFilter` correspondant (état initial repris des préférences).
+  - `versionCode = 1` (`// upstream: 0`).
+  - **Conserver les blocs BLC lors de toute resynchro upstream.**
+- **`src/all/mangaball`** : Correctifs fork marqués `// BLC -->` / `// BLC <--` :
+  - Filtre « has available chapters » (`Filters.kt`) et logique associée dans `MangaBall.kt`.
+  - **Conserver les blocs BLC lors de toute resynchro upstream.**
 
 ## Mandats Spécifiques pour Gemini
 - Toujours vérifier `exclude_build.json` avant de se plaindre d'un build manquant.
 - Ne jamais restaurer les extensions supprimées (Dynasty, etc.) sans confirmation explicite.
-- Ne jamais écraser ou réinitialiser `src/fr/japscan` ou `src/all/niadd` avec l'upstream sans préserver leurs composants et correctifs custom.
+- Ne jamais écraser ou réinitialiser `src/fr/japscan`, `src/all/niadd`, `src/all/mangadex`, `src/all/mangaball` ou `src/all/hentaipaw` avec l'upstream sans préserver leurs composants et correctifs custom (blocs `BLC`, solveur Japscan, tri/parsing Niadd, filtres HentaiPaw).
+- `src/all/hentaipaw` est une extension 100 % fork : ne jamais la considérer comme « en retard » sur l'upstream ni la supprimer lors d'un nettoyage.
 - Maintenir la compatibilité `repo.json` pour Komikku lors de chaque modification du workflow de build.
