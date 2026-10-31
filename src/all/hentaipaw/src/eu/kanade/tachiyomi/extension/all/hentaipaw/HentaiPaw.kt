@@ -83,11 +83,11 @@ class HentaiPaw(
     private fun ensureConfigured() {
         val url = apiUrl
         if (url.isBlank()) {
-            throw Exception("Adresse de l'API non configurée : veuillez renseigner l'URL de votre serveur Paw Bridge dans les paramètres de l'extension.")
+            throw Exception("API URL not configured: this extension is designed to work with a self-hosted proxy, contact the developer for more info.")
         }
         val secret = apiSecret
         if (secret.isBlank()) {
-            throw Exception("Clé API manquante : veuillez renseigner votre 'Clé secrète API' dans les paramètres de l'extension.")
+            throw Exception("Missing API secret: please enter your 'API Secret Key' in the extension settings.")
         }
     }
 
@@ -106,7 +106,7 @@ class HentaiPaw(
                 val secret = apiSecret
                 Log.d(TAG, "[$lang] API request: ${request.method} ${request.url.encodedPath} (hasSecret=${secret.isNotBlank()})")
                 if (secret.isBlank()) {
-                    throw Exception("Clé API manquante : veuillez renseigner votre 'Clé secrète API' dans les paramètres de l'extension HentaiPaw.")
+                    throw Exception("Missing API secret: please enter your 'API Secret Key' in the extension settings.")
                 }
                 val authenticatedRequest = request.newBuilder()
                     .header("X-Paw-Secret", secret)
@@ -117,7 +117,7 @@ class HentaiPaw(
                 Log.d(TAG, "[$lang] API response for ${request.url.encodedPath}: HTTP ${response.code}")
                 if (response.code == 401) {
                     response.close()
-                    throw Exception("Clé API invalide : vérifiez votre 'Clé secrète API' dans les paramètres de l'extension HentaiPaw.")
+                    throw Exception("Invalid API secret: verify your 'API Secret Key' in the extension settings.")
                 }
                 return@addInterceptor response
             }
@@ -336,9 +336,6 @@ class HentaiPaw(
         }.build()
 
         val dto = client.get(url.toString()).parseAs<MangaListPageDto>()
-        if (dto.mangas.isEmpty() && lang == "fr") {
-            throw Exception("Aucune œuvre en français disponible sur HentaiPaw. Veuillez utiliser la source HentaiPaw (en) ou HentaiPaw (all).")
-        }
         return MangasPage(dto.mangas.map { it.toSManga() }, dto.hasNextPage)
     }
 
@@ -401,12 +398,12 @@ class HentaiPaw(
 
         val filters = mutableListOf<Filter<*>>()
 
-        // 1. Langues (source 'all' uniquement)
+        // 1. Languages ('all' source only)
         if (lang == "all") {
             filters.add(MultiLanguageFilter())
         }
 
-        // 2. Tri
+        // 2. Sort
         filters.add(SortFilter())
 
         // 3. Pages
@@ -415,16 +412,16 @@ class HentaiPaw(
         // 4. Tags
         filters.add(TagFoldable(opts.tags))
 
-        // 5. Artistes
+        // 5. Artists
         filters.add(ArtistFoldable(opts.artists))
 
-        // 6. Personnages
+        // 6. Characters
         filters.add(CharacterFoldable(opts.characters))
 
         // 7. Parodies
         filters.add(ParodyFoldable(opts.parodies))
 
-        // 8. Groupes
+        // 8. Groups
         filters.add(GroupFoldable(opts.groups))
 
         return FilterList(filters)
@@ -436,51 +433,51 @@ class HentaiPaw(
 
     // Tags
     class TagCheckBox(name: String, id: Int) : FacetCheckBox(name, id)
-    class TagIncludeFilter : Filter.Text("Inclure tag (+)")
-    class TagExcludeFilter : Filter.Text("Exclure tag (-)")
+    class TagIncludeFilter : Filter.Text("Include tag (+)")
+    class TagExcludeFilter : Filter.Text("Exclude tag (-)")
     class TagFoldable(tags: List<FilterItemDto>) :
         FoldableFilter(
             "Tags",
             tags.map { TagCheckBox(it.name, it.id) } + listOf(TagIncludeFilter(), TagExcludeFilter()),
         )
 
-    // Artistes
+    // Artists
     class ArtistCheckBox(name: String, id: Int) : FacetCheckBox(name, id)
-    class ArtistIncludeFilter : Filter.Text("Inclure artiste (+)")
-    class ArtistExcludeFilter : Filter.Text("Exclure artiste (-)")
+    class ArtistIncludeFilter : Filter.Text("Include artist (+)")
+    class ArtistExcludeFilter : Filter.Text("Exclude artist (-)")
     class ArtistFoldable(artists: List<FilterItemDto>) :
         FoldableFilter(
-            "Artistes",
+            "Artists",
             artists.map { ArtistCheckBox(it.name, it.id) } + listOf(ArtistIncludeFilter(), ArtistExcludeFilter()),
         )
 
-    // Personnages
+    // Characters
     class CharacterCheckBox(name: String, id: Int) : FacetCheckBox(name, id)
-    class CharacterIncludeFilter : Filter.Text("Inclure personnage (+)")
-    class CharacterExcludeFilter : Filter.Text("Exclure personnage (-)")
+    class CharacterIncludeFilter : Filter.Text("Include character (+)")
+    class CharacterExcludeFilter : Filter.Text("Exclude character (-)")
     class CharacterFoldable(characters: List<FilterItemDto>) :
         FoldableFilter(
-            "Personnages",
+            "Characters",
             characters.map { CharacterCheckBox(it.name, it.id) } + listOf(CharacterIncludeFilter(), CharacterExcludeFilter()),
         )
 
     // Parodies
     class ParodyCheckBox(name: String, id: Int) : FacetCheckBox(name, id)
-    class ParodyIncludeFilter : Filter.Text("Inclure parodie (+)")
-    class ParodyExcludeFilter : Filter.Text("Exclure parodie (-)")
+    class ParodyIncludeFilter : Filter.Text("Include parody (+)")
+    class ParodyExcludeFilter : Filter.Text("Exclude parody (-)")
     class ParodyFoldable(parodies: List<FilterItemDto>) :
         FoldableFilter(
             "Parodies",
             parodies.map { ParodyCheckBox(it.name, it.id) } + listOf(ParodyIncludeFilter(), ParodyExcludeFilter()),
         )
 
-    // Groupes
+    // Groups
     class GroupCheckBox(name: String, id: Int) : FacetCheckBox(name, id)
-    class GroupIncludeFilter : Filter.Text("Inclure groupe (+)")
-    class GroupExcludeFilter : Filter.Text("Exclure groupe (-)")
+    class GroupIncludeFilter : Filter.Text("Include group (+)")
+    class GroupExcludeFilter : Filter.Text("Exclude group (-)")
     class GroupFoldable(groups: List<FilterItemDto>) :
         FoldableFilter(
-            "Groupes",
+            "Groups",
             groups.map { GroupCheckBox(it.name, it.id) } + listOf(GroupIncludeFilter(), GroupExcludeFilter()),
         )
 
@@ -497,26 +494,26 @@ class HentaiPaw(
 
     class MultiLanguageFilter :
         Filter.Group<LanguageCheckBox>(
-            "Langues",
+            "Languages",
             LANGUAGES.map { LanguageCheckBox(it.first, it.second) },
         ) {
         companion object {
             private val LANGUAGES = listOf(
-                Pair("Français (FR)", "fr"),
-                Pair("Anglais (US)", "us"),
-                Pair("Japonais (JP)", "jp"),
-                Pair("Chinois (CN)", "cn"),
-                Pair("Espagnol (ES)", "es"),
-                Pair("Coréen (KR)", "kr"),
-                Pair("Portugais (PT)", "pt"),
+                Pair("French (FR)", "fr"),
+                Pair("English (US)", "us"),
+                Pair("Japanese (JP)", "jp"),
+                Pair("Chinese (CN)", "cn"),
+                Pair("Spanish (ES)", "es"),
+                Pair("Korean (KR)", "kr"),
+                Pair("Portuguese (PT)", "pt"),
             )
         }
     }
 
     class SortFilter :
         Filter.Select<String>(
-            "Trier par",
-            arrayOf("Derniers ajouts", "Popularité", "Nombre de pages", "Aléatoire"),
+            "Sort by",
+            arrayOf("Latest", "Popular", "Pages", "Random"),
         ) {
         val selectedSort: String
             get() = when (state) {
@@ -531,10 +528,10 @@ class HentaiPaw(
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
             key = API_URL_PREF
-            title = "Adresse de l'API Paw Bridge"
-            summary = apiUrl.ifBlank { "Non configurée" }
-            dialogTitle = "URL du serveur Paw Bridge"
-            dialogMessage = "Entrez l'URL de votre serveur Paw Bridge (contacter le dev pour plus d'info)"
+            title = "Paw Bridge API Address"
+            summary = apiUrl.ifBlank { "Not configured" }
+            dialogTitle = "Paw Bridge Server URL"
+            dialogMessage = "Enter your Paw Bridge server URL (contact the developer for more info)"
             text = apiUrl
             setDefaultValue("")
             setOnPreferenceChangeListener { _, newValue ->
@@ -542,16 +539,16 @@ class HentaiPaw(
                 Log.d(TAG, "[$lang] Setting new API URL: $newUrl")
                 globalPrefs.edit().putString(API_URL_PREF, newUrl).apply()
                 preferences.edit().putString(API_URL_PREF, newUrl).apply()
-                summary = newUrl.ifBlank { "Non configurée" }
+                summary = newUrl.ifBlank { "Not configured" }
                 true
             }
         }.also(screen::addPreference)
 
         EditTextPreference(screen.context).apply {
             key = API_SECRET_PREF
-            title = "Clé secrète API"
-            summary = if (apiSecret.isNotBlank()) "••••••••" else "Non configurée"
-            dialogTitle = "Clé secrète de l'API Paw Bridge"
+            title = "API Secret Key"
+            summary = if (apiSecret.isNotBlank()) "••••••••" else "Not configured"
+            dialogTitle = "Paw Bridge API Secret Key"
             text = apiSecret
             setDefaultValue("")
             setOnPreferenceChangeListener { _, newValue ->
@@ -559,7 +556,7 @@ class HentaiPaw(
                 Log.d(TAG, "[$lang] Setting new API secret (len=${secret.length})")
                 globalPrefs.edit().putString(API_SECRET_PREF, secret).apply()
                 preferences.edit().putString(API_SECRET_PREF, secret).apply()
-                summary = if (secret.isNotBlank()) "••••••••" else "Non configurée"
+                summary = if (secret.isNotBlank()) "••••••••" else "Not configured"
                 true
             }
         }.also(screen::addPreference)
