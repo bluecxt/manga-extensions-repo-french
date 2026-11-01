@@ -24,6 +24,7 @@ import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
+import okhttp3.Request
 
 @Source
 class HentaiPaw(
@@ -394,7 +395,39 @@ class HentaiPaw(
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         ensureConfigured()
         val pages = client.get("$baseUrl${chapter.url}").parseAs<List<PageDto>>()
-        return pages.map { Page(it.index, "", it.imageUrl) }
+        return pages.map { page ->
+            val absoluteImageUrl = when {
+                page.imageUrl.startsWith("http://") || page.imageUrl.startsWith("https://") -> page.imageUrl
+                page.imageUrl.startsWith("/") -> "$baseUrl${page.imageUrl}"
+                else -> "$baseUrl/${page.imageUrl}"
+            }
+            Page(page.index, "", absoluteImageUrl)
+        }
+    }
+
+    override fun imageRequest(page: Page): Request {
+        val imageUrl = page.imageUrl ?: return super.imageRequest(page)
+        val fullUrl = when {
+            imageUrl.startsWith("http://") || imageUrl.startsWith("https://") -> imageUrl
+            imageUrl.startsWith("/") -> "$baseUrl$imageUrl"
+            else -> "$baseUrl/$imageUrl"
+        }
+
+        val builder = Request.Builder().url(fullUrl)
+        val requestHost = fullUrl.toHttpUrlOrNull()?.host
+        val currentApiHost = apiUrl.toHttpUrlOrNull()?.host
+
+        if (currentApiHost != null && requestHost == currentApiHost) {
+            val secret = apiSecret
+            if (secret.isNotBlank()) {
+                builder.header("X-Paw-Secret", secret)
+                builder.header("Authorization", "Bearer $secret")
+            }
+        } else {
+            builder.header("Referer", "https://hentaipaw.com/")
+        }
+
+        return builder.build()
     }
 
     // Filters UI
