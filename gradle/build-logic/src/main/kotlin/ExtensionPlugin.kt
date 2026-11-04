@@ -21,6 +21,7 @@ import io.github.keiyoushi.gradle.internal.extensions.ksp
 import io.github.keiyoushi.gradle.internal.extensions.libs
 import io.github.keiyoushi.gradle.internal.extensions.plugins
 import io.github.keiyoushi.gradle.internal.toMetadata
+import io.github.keiyoushi.gradle.tasks.ComputeContentHashTask
 import io.github.keiyoushi.gradle.tasks.CreateExtensionJarTask
 import io.github.keiyoushi.gradle.tasks.GenerateManifestTask
 import io.github.keiyoushi.gradle.tasks.GenerateSourceInfoTask
