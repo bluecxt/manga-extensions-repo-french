@@ -26,9 +26,7 @@ dependencyResolutionManagement {
     }
 }
 
-enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
-
-rootProject.name = "manga-extensions-repo-french"
+rootProject.name = "Yuzono-Manga"
 
 /**
  * Add or remove modules to load as needed for local development here.
