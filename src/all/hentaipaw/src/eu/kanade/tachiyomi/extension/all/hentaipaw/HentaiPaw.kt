@@ -405,8 +405,8 @@ class HentaiPaw(
         }
     }
 
-    override fun imageRequest(page: Page): Request {
-        val imageUrl = page.imageUrl ?: return super.imageRequest(page)
+    override fun getImageRequest(page: Page): Request {
+        val imageUrl = page.imageUrl ?: return super.getImageRequest(page)
         val fullUrl = when {
             imageUrl.startsWith("http://") || imageUrl.startsWith("https://") -> imageUrl
             imageUrl.startsWith("/") -> "$baseUrl$imageUrl"
