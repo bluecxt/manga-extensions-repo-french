@@ -13,6 +13,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.applicationContext
@@ -231,7 +232,7 @@ class HentaiPaw(
         } else {
             "$baseUrl/api/manga/popular?page=$page"
         }
-        val dto = client.get(url).parseAs<MangaListPageDto>()
+        val dto = client.get(url, Fetch.XHR).parseAs<MangaListPageDto>()
         return MangasPage(dto.mangas.map { it.toSManga() }, dto.hasNextPage)
     }
 
@@ -244,7 +245,7 @@ class HentaiPaw(
         } else {
             "$baseUrl/api/manga/latest?page=$page"
         }
-        val dto = client.get(url).parseAs<MangaListPageDto>()
+        val dto = client.get(url, Fetch.XHR).parseAs<MangaListPageDto>()
         return MangasPage(dto.mangas.map { it.toSManga() }, dto.hasNextPage)
     }
 
@@ -344,7 +345,7 @@ class HentaiPaw(
             }
         }.build()
 
-        val dto = client.get(url.toString()).parseAs<MangaListPageDto>()
+        val dto = client.get(url.toString(), Fetch.XHR).parseAs<MangaListPageDto>()
         return MangasPage(dto.mangas.map { it.toSManga() }, dto.hasNextPage)
     }
 
@@ -358,14 +359,14 @@ class HentaiPaw(
         ensureConfigured()
         Log.d(TAG, "[$lang] fetchMangaUpdate for ${manga.url} (fetchDetails=$fetchDetails, fetchChapters=$fetchChapters)")
         val updatedManga = if (fetchDetails) {
-            val dto = client.get("$baseUrl${manga.url}").parseAs<MangaDto>()
+            val dto = client.get("$baseUrl${manga.url}", Fetch.XHR).parseAs<MangaDto>()
             dto.toSManga(isDetails = true)
         } else {
             manga
         }
 
         val updatedChapters = if (fetchChapters) {
-            val chapterDtos = client.get("$baseUrl${manga.url}/chapters").parseAs<List<ChapterDto>>()
+            val chapterDtos = client.get("$baseUrl${manga.url}/chapters", Fetch.XHR).parseAs<List<ChapterDto>>()
             chapterDtos.map { dto ->
                 SChapter.create().apply {
                     name = dto.name
@@ -394,7 +395,7 @@ class HentaiPaw(
     // Page List
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         ensureConfigured()
-        val pages = client.get("$baseUrl${chapter.url}").parseAs<List<PageDto>>()
+        val pages = client.get("$baseUrl${chapter.url}", Fetch.XHR).parseAs<List<PageDto>>()
         return pages.map { page ->
             val absoluteImageUrl = when {
                 page.imageUrl.startsWith("http://") || page.imageUrl.startsWith("https://") -> page.imageUrl

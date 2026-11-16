@@ -52,16 +52,17 @@ class MangaDexFilters {
         fun addQueryParameter(url: HttpUrl.Builder, dexLang: String)
     }
 
-    // BLC -->
     private class HasAvailableChaptersFilter(intl: Intl, defaultState: Boolean = false) :
+        // BLC: default state comes from the persisted preference
         Filter.CheckBox(intl["has_available_chapters"], defaultState),
         UrlQueryFilter {
-        // BLC <--
 
         override fun addQueryParameter(url: HttpUrl.Builder, dexLang: String) {
             if (state) {
                 url.addQueryParameter("hasAvailableChapters", "true")
-                url.addQueryParameter("availableTranslatedLanguage[]", dexLang)
+                if (dexLang != MDConstants.ALL_LANGUAGES) {
+                    url.addQueryParameter("availableTranslatedLanguage[]", dexLang)
+                }
             }
         }
     }

@@ -39,10 +39,6 @@ class SortFilter :
     }
 }
 
-// BLC -->
-class HasAvailableChaptersFilter(name: String = "Has available chapters", defaultState: Boolean = false) : Filter.CheckBox(name, defaultState)
-// BLC <--
-
 class TypeFilter :
     SelectFilter<String>(
         "Type",
@@ -54,6 +50,36 @@ class TypeFilter :
             "Comics" to "comics",
         ),
     )
+
+// The API matches a single code as the site stores it, e.g. "cn" rather than "zh" for most Chinese titles.
+class OriginalLanguageFilter :
+    SelectFilter<String>(
+        "Original Language",
+        options = listOf(
+            "All" to "",
+            "Japanese" to "ja",
+            "Korean" to "ko",
+            "Chinese" to "cn",
+            "English" to "en",
+            "Filipino" to "tl",
+            "French" to "fr",
+            "German" to "de",
+            "Indonesian" to "id",
+            "Italian" to "it",
+            "Malay" to "ms",
+            "Polish" to "pl",
+            "Portuguese (BR)" to "pt-br",
+            "Russian" to "ru",
+            "Spanish" to "es",
+            "Swedish" to "sv",
+            "Thai" to "th",
+            "Vietnamese" to "vi",
+        ),
+    )
+
+// BLC -->
+class TranslatedLanguageFilter(defaultState: Boolean = true) : Filter.CheckBox("Only titles with chapters in this language", defaultState)
+// BLC <--
 
 class DemographicFilter :
     SelectFilter<String>(
