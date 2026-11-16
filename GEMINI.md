@@ -41,9 +41,26 @@ Les dépôts parents configurés :
 - **cursed** : `https://github.com/yuzono/cursed-manga-extensions.git` (Branche : `main` — l'ancienne branche `master` a été supprimée upstream et fusionnée dans `main`)
 
 #### Dernière Maintenance
-- **Date :** 31 Octobre 2026
+- **Date :** 16 Novembre 2026
 - **État :**
-  - Remotes synchronisés via `git fetch --all --prune`. `yuzono/main` = `853268fc7d`, `cursed/main` = `5dad5cf65d`.
+  - Remotes synchronisés. `yuzono/main` = `20b3d15c3a`, `cursed/main` = `728635a04a` (branche `master` toujours absente).
+  - **Note environnement :** `origin` est en SSH (`git@cle-perso`). Dans un shell sans `ssh` au `PATH`, préfixer : `PATH=/run/current-system/sw/bin:$PATH git ...`.
+  - `core`, `lib`, `lib-multisrc`, `compiler` : synchronisés depuis `yuzono/main` (nouvelle API `Fetch`, `Markdown`, `RemoteZip`, `BaseUrlFetchInterceptor`, tests core). Bibliothèques fork-only conservées : `twocaptcha`, `cryptoaes`, `seedrandom`, `zipinterceptor`, `cookieinterceptor`, `randomua`.
+  - `compiler` (processeur KSP) : **doit rester aligné sur `core`** — sinon les `Generated.kt` utilisent l'ancien DSL (`mirrors` vs `defaultMirrors`) et le build casse.
+  - `gradle/libs.versions.toml` : ajout de `androidx-webkit` (requis par les tests core).
+  - Fichier fork-only `core/.../zip/coroutines/Zip.kt` supprimé : plus utilisé et incompatible avec le nouveau `RemoteZip` upstream.
+  - **39 extensions resynchronisées** (dont `animesama`, `manganova`, `scanr`, `scanmanga`, `akuma`, `hentai3`, `mangafire`, `mangaplus`, `mangamillion`, `imhentai`, `mangago`, `readcomicsonline`, `ehentai`/`hitomi`/`nhentai`/`pururin` depuis `cursed`).
+  - **Customs mis à jour (upstream + correctifs fork) :**
+    - `src/all/niadd` : import de l'upstream #20755 (lecture des pages via `readerJumpUrl`/`JUMP_URL_REGEX`) et de la fetch API ; **réapplication** de `CHAPTER_NUMBER_REGEX`, des sélecteurs de repli et du tri descendant. `versionCode = 6`.
+    - `src/all/mangadex` : import de l'upstream (source all-languages, chapitres à 0 page) ; **réapplication** des blocs BLC `hasAvailableChapters` (préférence + filtre). `versionCode = 5`.
+    - `src/all/mangaball` : import de l'upstream (filtres langue originale/traduite) ; la préférence BLC alimente désormais `TranslatedLanguageFilter`. `versionCode = 8`.
+    - `src/fr/japscan` : migré vers la nouvelle fetch API (`get(url, Fetch.NONE)` / `post(url, headers, Fetch.NONE, body)`), correctifs WebView/challenge conservés. `versionCode = 74`.
+    - `src/all/hentaipaw` : migré vers la nouvelle fetch API (`client.get(..., Fetch.XHR)`). `versionCode = 10`.
+  - Validation : `./gradlew compileDebugKotlin` → **BUILD SUCCESSFUL**.
+  - **Reste à importer (25 nouvelles extensions FR upstream)** : `banchanscan`, `blossomscans`, `chaostrad`, `comicstracker`, `crunchyscanunoriginal`, `dassouscan`, `epsilonscan`, `hanabook`, `japscanst`, `kanakonohast`, `lelscan`, `mangadraftst`, `mangahubfr`, `mangaplexe`, `mangasoriginesfr`, `mangasoriginesst`, `onlyyaoiscantrad`, `onlyyuriscantrad`, `punkrecords`, `softepsilonscan`, `sushiscanst`, `twatt`, `universotakust`, `yaoiscan`, `yureiscan`.
+
+#### Historique (31 Octobre 2026)
+
   - **Note environnement :** `origin` est en SSH (`git@cle-perso`). Dans un shell sans `ssh` au `PATH`, préfixer : `PATH=/run/current-system/sw/bin:$PATH git fetch origin`.
   - `core` : Synchronisé avec l'upstream — `Crypto.kt` étendu (+119 lignes, +46 dans `CryptoTest.kt`), `NextJs.kt` mis à jour (assemblage des chunks Next.js flight, + `NextJsTest.kt`), suppression de `reactFlight/ReactFlightDate.kt`.
   - `lib/` : Bibliothèques partagées déjà à jour (aucun diff). Bibliothèques fork-only conservées : `twocaptcha` (Japscan), `cryptoaes`, `seedrandom`, `zipinterceptor`, `cookieinterceptor`.
