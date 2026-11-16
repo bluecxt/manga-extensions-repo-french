@@ -20,6 +20,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import eu.kanade.tachiyomi.source.model.UpdateStrategy
 import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.asJsoup
@@ -144,7 +145,7 @@ abstract class Hentai3 :
             page == 1 -> "$baseUrl/language/$searchLang?sort=$defaultPopularSort"
             else -> "$baseUrl/language/$searchLang/$page?sort=$defaultPopularSort"
         }
-        val doc = client.get(url).asJsoup()
+        val doc = client.get(url, Fetch.DOCUMENT).asJsoup()
         return parseMangasPage(doc)
     }
 
@@ -154,7 +155,7 @@ abstract class Hentai3 :
         } else {
             "$baseUrl/search?q=pages%3A>0&page=$page"
         }
-        val doc = client.get(url).asJsoup()
+        val doc = client.get(url, Fetch.DOCUMENT).asJsoup()
         return parseMangasPage(doc)
     }
 
@@ -169,9 +170,7 @@ abstract class Hentai3 :
     private val popularMangaNextPageSelector = "a[rel=next]"
 
     private fun popularMangaFromElement(element: Element): SManga = SManga.create().apply {
-        title = element.selectFirst("div.title")!!.ownText()
-            .replace("\"", "")
-            .shortenTitle()
+        title = element.selectFirst("div.title")!!.ownText().shortenTitle()
         setUrlWithoutDomain(element.absUrl("href"))
         thumbnail_url = element.selectFirst(".cover img")?.getImage()
     }
@@ -181,7 +180,7 @@ abstract class Hentai3 :
         query.startsWith(PREFIX_ID_SEARCH) -> MangasPage(listOf(searchMangaById(query.removePrefix(PREFIX_ID_SEARCH))), false)
         else -> {
             val url = searchMangaRequestUrl(page, query, filters)
-            val response = client.get(url)
+            val response = client.get(url, Fetch.DOCUMENT)
             val document = response.asJsoup()
 
             if (response.request.url.toString().contains("/login") &&
@@ -196,7 +195,7 @@ abstract class Hentai3 :
 
     private suspend fun searchMangaById(id: String): SManga {
         if (id.toIntOrNull() == null) throw Exception("Incorrect ID")
-        val document = client.get("$baseUrl/d/$id").asJsoup()
+        val document = client.get("$baseUrl/d/$id", Fetch.DOCUMENT).asJsoup()
         return parseMangaDetails(document)
     }
 
@@ -275,11 +274,7 @@ abstract class Hentai3 :
     }
 
     private fun parseMangaDetails(document: Document): SManga {
-        val fullTitle = document.select("#main-info > h1").text()
-            .replace("\"", "").trim()
-        val shortTitle = document.select("#main-info > h1 > span").text()
-            .replace("\"", "").trim()
-            .takeIf { !displayFullTitle && it.isNotEmpty() }
+        val fullTitle = document.select("#main-info h1").text()
 
         return SManga.create().apply {
             setUrlWithoutDomain(document.location())
@@ -288,21 +283,20 @@ abstract class Hentai3 :
             val artists = getArtists(document)
             initialized = true
 
-            title = shortTitle ?: fullTitle.shortenTitle()
+            title = fullTitle.shortenTitle()
 
             author = authors ?: artists
             artist = artists ?: authors
 
             val code = getCodes(document)
             // Some people want these additional details in description
-            description = "Full English and Japanese titles:\n"
-                .plus("$fullTitle\n\n")
+            description = (if (title == fullTitle) "" else "Full title: $fullTitle\n\n")
                 .plus(code ?: "")
-                .plus("Pages: ${getNumPages(document)}\n")
+                .plus(getNumPages(document)?.let { "Pages: $it\n" } ?: "")
                 .plus(getDescriptions(document))
             genre = getTags(document)
 
-            thumbnail_url = document.selectFirst("#main-cover img")?.getImage()
+            thumbnail_url = document.selectFirst("#main-info img")?.getImage()
             status = SManga.COMPLETED
             update_strategy = UpdateStrategy.ONLY_FETCH_ONCE
         }
@@ -323,7 +317,7 @@ abstract class Hentai3 :
         fetchChapters: Boolean,
     ): SMangaUpdate {
         val mangaUrl = getMangaUrl(manga)
-        val document = client.get(mangaUrl).asJsoup()
+        val document = client.get(mangaUrl, Fetch.DOCUMENT).asJsoup()
 
         val updatedManga = parseMangaDetails(document)
         val updatedChapters = parseChapterList(document, mangaUrl)
@@ -335,17 +329,17 @@ abstract class Hentai3 :
     override val supportsRelatedMangas = true
 
     private fun relatedMangaListSelector(): String = if (flagLang.isNotEmpty()) {
-        "$popularMangaSelector:has(.title.flag-$flagLang), $popularMangaSelector:has(.title:not(.flag))"
+        "#similar-content .doujin.flag-$flagLang a.cover, #similar-content .doujin:not(.flag) a.cover"
     } else {
-        popularMangaSelector
+        "#similar-content a.cover"
     }
 
-    override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> = client.get(getMangaUrl(manga)).asJsoup()
+    override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
         .select(relatedMangaListSelector()).map(::popularMangaFromElement)
 
     // Pages
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val doc = client.get(getChapterUrl(chapter)).asJsoup()
+        val doc = client.get(getChapterUrl(chapter), Fetch.DOCUMENT).asJsoup()
         return doc.select("#thumbnail-gallery .single-thumb a > img")
             .mapIndexed { index, image ->
                 Page(index, imageUrl = image.getImage())

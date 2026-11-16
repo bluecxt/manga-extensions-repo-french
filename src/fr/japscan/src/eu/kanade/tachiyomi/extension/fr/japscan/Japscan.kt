@@ -23,6 +23,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.lib.twocaptcha.TwoCaptcha
+import keiyoushi.network.Fetch
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
@@ -98,9 +99,9 @@ abstract class Japscan :
     // a cloudflare protected page
     override fun getHomeUrl() = "$baseUrl/mangas/?sort=popular&p=1"
 
-    override suspend fun getPopularManga(page: Int) = parseMangaList(client.get("$baseUrl/mangas/?sort=popular&p=$page").asJsoup())
+    override suspend fun getPopularManga(page: Int) = parseMangaList(client.get("$baseUrl/mangas/?sort=popular&p=$page", Fetch.NONE).asJsoup())
 
-    override suspend fun getLatestUpdates(page: Int) = parseMangaList(client.get("$baseUrl/mangas/?sort=updated&p=$page").asJsoup())
+    override suspend fun getLatestUpdates(page: Int) = parseMangaList(client.get("$baseUrl/mangas/?sort=updated&p=$page", Fetch.NONE).asJsoup())
 
     private fun parseMangaList(document: Document): MangasPage {
         val mangas = document.select(".mangas-list .manga-block:not(:has(a[href='']))").map { element ->
@@ -120,7 +121,7 @@ abstract class Japscan :
         if (query.isBlank()) return getPopularManga(page)
         val body = FormBody.Builder().add("search", query).build()
         val searchHeaders = headers.newBuilder().add("X-Requested-With", "XMLHttpRequest").build()
-        val results = client.post("$baseUrl/ls/", searchHeaders, body).parseAs<List<SearchResultDto>>()
+        val results = client.post("$baseUrl/ls/", searchHeaders, Fetch.NONE, body).parseAs<List<SearchResultDto>>()
         return MangasPage(results.map { it.toSManga(baseUrl) }, false)
     }
 
@@ -129,7 +130,7 @@ abstract class Japscan :
         val segments = url.pathSegments.filter(String::isNotEmpty)
         if (segments.size < 2 || segments[0] !in CHAPTER_PATH_TYPES) return null
         val mangaUrl = "/${segments[0]}/${segments[1]}/"
-        val document = client.get(baseUrl + mangaUrl).asJsoup()
+        val document = client.get(baseUrl + mangaUrl, Fetch.NONE).asJsoup()
         return parseMangaDetails(document).apply {
             this.url = mangaUrl
             title = document.selectFirst("#main .card-body h1")!!.text()
@@ -142,7 +143,7 @@ abstract class Japscan :
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val response = client.get(baseUrl + manga.url)
+        val response = client.get(baseUrl + manga.url, Fetch.NONE)
         val mangaSlug = extractMangaSlug(response.request.url)
         val document = response.asJsoup()
         val details = parseMangaDetails(document).apply {
@@ -299,7 +300,7 @@ abstract class Japscan :
         return jsInterface.snapshot().mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
     }
 
-    private suspend fun captchaPresent(chapterUrl: String): Boolean = client.get(chapterUrl, CacheControl.FORCE_NETWORK).use {
+    private suspend fun captchaPresent(chapterUrl: String): Boolean = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK).use {
         CAPTCHA_REGEX.containsMatchIn(it.body.string())
     }
 
@@ -348,7 +349,7 @@ abstract class Japscan :
 
     private suspend fun trySolveCustomChallenge(chapterUrl: String): Boolean {
         var autoCaptchaTry = 0
-        var pageContent = client.get(chapterUrl, CacheControl.FORCE_NETWORK).use { it.body.string() }
+        var pageContent = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK).use { it.body.string() }
 
         while (autoCaptchaTry < 3) {
             val stripsMatch = STRIPS_ARRAY_REGEX.find(pageContent)
@@ -389,14 +390,14 @@ abstract class Japscan :
 
                     if (solved) {
                         Log.d("JapscanDebug", "Captcha solved successfully! Verifying...")
-                        pageContent = client.get(chapterUrl, CacheControl.FORCE_NETWORK).use { it.body.string() }
+                        pageContent = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK).use { it.body.string() }
                         if (!CAPTCHA_REGEX.containsMatchIn(pageContent)) {
                             Log.d("JapscanDebug", "Captcha cleared after solve!")
                             return true
                         }
                     } else {
                         Log.d("JapscanDebug", "Captcha solving attempt #$autoCaptchaTry failed. Re-fetching chapter...")
-                        pageContent = client.get(chapterUrl, CacheControl.FORCE_NETWORK).use { it.body.string() }
+                        pageContent = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK).use { it.body.string() }
                     }
                 } else {
                     Log.d("JapscanDebug", "Captcha items count is not 4: ${items.size}")
