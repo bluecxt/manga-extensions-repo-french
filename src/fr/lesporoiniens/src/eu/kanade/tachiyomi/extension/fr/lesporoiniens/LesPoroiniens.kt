@@ -26,6 +26,7 @@ abstract class LesPoroiniens : KeiSource() {
     companion object {
         private const val SERIES_DATA_SELECTOR = "#series-data-placeholder"
         private const val READER_DATA_SELECTOR = "#reader-data-placeholder"
+        private const val IMGCHEST_DELETED_MESSAGE = "Images supprimées de l'hébergeur ImgChest"
     }
 
     override val supportsLatest = false
@@ -167,8 +168,13 @@ abstract class LesPoroiniens : KeiSource() {
 
         val imageUrls = if (chapterUrl.contains("imgchest")) {
             val chapterId = chapterUrl.substringAfterLast("/")
-            client.get("$baseUrl/api/imgchest-chapter-pages?id=$chapterId", Fetch.XHR).parseAs<List<PageData>>()
-                .map { it.link }
+            client.get("$baseUrl/api/imgchest-chapter-pages?id=$chapterId", Fetch.XHR).use { response ->
+                val body = response.body.string()
+                if (!response.isSuccessful && body.contains("ImgChest", ignoreCase = true)) {
+                    throw Exception(IMGCHEST_DELETED_MESSAGE)
+                }
+                body.parseAs<List<PageData>>().map { it.link }
+            }
         } else {
             client.get("$baseUrl$chapterUrl", Fetch.XHR).parseAs<List<String>>()
         }
