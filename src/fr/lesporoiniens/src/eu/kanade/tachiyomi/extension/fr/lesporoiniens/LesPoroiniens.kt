@@ -170,7 +170,7 @@ abstract class LesPoroiniens : KeiSource() {
             val chapterId = chapterUrl.substringAfterLast("/")
             client.get("$baseUrl/api/imgchest-chapter-pages?id=$chapterId", Fetch.XHR).use { response ->
                 val body = response.body.string()
-                if (!response.isSuccessful && body.contains("ImgChest", ignoreCase = true)) {
+                if (response.code == 500 && body.contains("ImgChest", ignoreCase = true)) {
                     throw Exception(IMGCHEST_DELETED_MESSAGE)
                 }
                 body.parseAs<List<PageData>>().map { it.link }
