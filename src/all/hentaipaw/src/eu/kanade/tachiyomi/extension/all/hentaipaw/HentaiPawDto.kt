@@ -29,8 +29,8 @@ data class MangaDto(
         url = "/api/manga/$id"
         val rawThumb = this@MangaDto.thumbnailUrl ?: this@MangaDto.coverUrl
         thumbnail_url = when {
-            rawThumb != null && rawThumb.contains("/thumbnails/cover.webp") ->
-                "https://cdn.imagedeliveries.com/$id/thumbnails/cover.webp"
+            rawThumb.isNullOrBlank() -> "https://cdn.imagedeliveries.com/$id/thumbnails/cover.webp"
+            rawThumb.startsWith("/") -> "https://cdn.imagedeliveries.com$rawThumb"
             else -> rawThumb
         }
         artist = this@MangaDto.artist
