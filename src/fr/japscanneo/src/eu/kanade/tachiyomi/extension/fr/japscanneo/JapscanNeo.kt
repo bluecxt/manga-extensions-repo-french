@@ -33,7 +33,7 @@ abstract class JapscanNeo :
     private val apiClient: OkHttpClient by lazy {
         client.newBuilder()
             .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(60, TimeUnit.SECONDS)
+            .readTimeout(150, TimeUnit.SECONDS)
             .build()
     }
 
