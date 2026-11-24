@@ -41,23 +41,23 @@ Les dépôts parents configurés :
 - **cursed** : `https://github.com/yuzono/cursed-manga-extensions.git` (Branche : `main` — l'ancienne branche `master` a été supprimée upstream et fusionnée dans `main`)
 
 #### Dernière Maintenance
-- **Date :** 16 Novembre 2026
+- **Date :** 24 Novembre 2026
 - **État :**
-  - Remotes synchronisés. `yuzono/main` = `20b3d15c3a`, `cursed/main` = `728635a04a` (branche `master` toujours absente).
-  - **Note environnement :** `origin` est en SSH (`git@cle-perso`). Dans un shell sans `ssh` au `PATH`, préfixer : `PATH=/run/current-system/sw/bin:$PATH git ...`.
-  - `core`, `lib`, `lib-multisrc`, `compiler` : synchronisés depuis `yuzono/main` (nouvelle API `Fetch`, `Markdown`, `RemoteZip`, `BaseUrlFetchInterceptor`, tests core). Bibliothèques fork-only conservées : `twocaptcha`, `cryptoaes`, `seedrandom`, `zipinterceptor`, `cookieinterceptor`, `randomua`.
-  - `compiler` (processeur KSP) : **doit rester aligné sur `core`** — sinon les `Generated.kt` utilisent l'ancien DSL (`mirrors` vs `defaultMirrors`) et le build casse.
-  - `gradle/libs.versions.toml` : ajout de `androidx-webkit` (requis par les tests core).
-  - Fichier fork-only `core/.../zip/coroutines/Zip.kt` supprimé : plus utilisé et incompatible avec le nouveau `RemoteZip` upstream.
-  - **39 extensions resynchronisées** (dont `animesama`, `manganova`, `scanr`, `scanmanga`, `akuma`, `hentai3`, `mangafire`, `mangaplus`, `mangamillion`, `imhentai`, `mangago`, `readcomicsonline`, `ehentai`/`hitomi`/`nhentai`/`pururin` depuis `cursed`).
-  - **Customs mis à jour (upstream + correctifs fork) :**
-    - `src/all/niadd` : import de l'upstream #20755 (lecture des pages via `readerJumpUrl`/`JUMP_URL_REGEX`) et de la fetch API ; **réapplication** de `CHAPTER_NUMBER_REGEX`, des sélecteurs de repli et du tri descendant. `versionCode = 6`.
-    - `src/all/mangadex` : import de l'upstream (source all-languages, chapitres à 0 page) ; **réapplication** des blocs BLC `hasAvailableChapters` (préférence + filtre). `versionCode = 5`.
-    - `src/all/mangaball` : import de l'upstream (filtres langue originale/traduite) ; la préférence BLC alimente désormais `TranslatedLanguageFilter`. `versionCode = 8`.
-    - `src/fr/japscan` : migré vers la nouvelle fetch API (`get(url, Fetch.NONE)` / `post(url, headers, Fetch.NONE, body)`), correctifs WebView/challenge conservés. `versionCode = 74`.
-    - `src/all/hentaipaw` : migré vers la nouvelle fetch API (`client.get(..., Fetch.XHR)`). `versionCode = 10`.
-  - Validation : `./gradlew compileDebugKotlin` → **BUILD SUCCESSFUL**.
-  - **Reste à importer (25 nouvelles extensions FR upstream)** : `banchanscan`, `blossomscans`, `chaostrad`, `comicstracker`, `crunchyscanunoriginal`, `dassouscan`, `epsilonscan`, `hanabook`, `japscanst`, `kanakonohast`, `lelscan`, `mangadraftst`, `mangahubfr`, `mangaplexe`, `mangasoriginesfr`, `mangasoriginesst`, `onlyyaoiscantrad`, `onlyyuriscantrad`, `punkrecords`, `softepsilonscan`, `sushiscanst`, `twatt`, `universotakust`, `yaoiscan`, `yureiscan`.
+  - Remotes : `yuzono/main` = `dc4572c0fa` (**207 commits** depuis le 16/11), `cursed/main` = `728635a04a` (inchangé). `origin` en SSH → préfixer `PATH=/run/current-system/sw/bin:$PATH git ...`.
+  - **Supprimées (sites morts, retirées upstream et vérifiées) :** `src/fr/bananascan` (`harmony-scan.fr`, DNS KO), `src/fr/histoiredhentai` (`hhentai.fr`, DNS KO), `src/fr/sushiscanfr` (`sushiscan.fr`, connexion refusée).
+  - `core`, `lib`, `lib-multisrc`, `compiler` : resynchronisés depuis `yuzono/main`.
+  - **Nouvelle API `keiyoushi.source.SMangaUpdate`** (callback `{ manga, chapters }`, core #21272) : 6 extensions adaptées — `hitomi` (v44), `ehentai` (v2), `nhentai` (v2), `pururin` (v3) — qui viennent de `cursed` et utilisent encore l'ancienne classe de `extensions-lib` — plus `japscan` (v75) et `hentaipaw` (v11).
+  - `lib/webviewpatch` (nouvelle lib upstream) **retirée** : inutilisée ici et son DSL `keiyoushiRuntime` n'existe pas dans notre build-logic.
+  - **33 extensions resynchronisées** : 23 FR (`animesama`, `manganova`, `scanr`, `scanmanga`, `sushiscan`, `aniverse`, `bdplus`, `poseidonscans`, `rimuscans`, `ortegascans`…), 3 EN (`mangago`, `mangakakalot`, `manganelo`), 7 ALL (`akuma`, `hentai3`, `mangafire`, `mangaplus`, `mangamillion`, `pandachaika`, `hennojin`).
+  - **Customs mis à jour :**
+    - `src/all/niadd` : import upstream #21381 (listing original works) + #21347 (chapitre via le reader du site) ; **réapplication** de `CHAPTER_NUMBER_REGEX`, sélecteurs de repli et tri descendant. `versionCode = 8`.
+    - `src/all/mangadex` : blocs BLC `hasAvailableChapters` réappliqués (préférence + filtre). `versionCode = 6`.
+    - `src/all/mangaball` : préférence BLC branchée sur `TranslatedLanguageFilter` upstream. `versionCode = 8`.
+    - `src/fr/japscan` : `@Source` conservé, `SMangaUpdate` migré, fetch API inchangée. `versionCode = 75`.
+    - `src/all/hentaipaw` : `SMangaUpdate` + `Fetch.XHR`. `versionCode = 11`.
+  - Validation : `./gradlew compileDebugKotlin` **BUILD SUCCESSFUL** + `assembleDebug` OK sur les 5 customs.
+  - **Attention :** après un `git rm` d'extension, supprimer aussi le dossier résiduel (`rm -rf src/<lang>/<ext>`) — sinon `loadAllIndividualExtensions()` le charge et KSP échoue.
+  - **Reste à importer (25 nouvelles FR upstream)** : `banchanscan`, `blossomscans`, `chaostrad`, `comicstracker`, `crunchyscanunoriginal`, `dassouscan`, `epsilonscan`, `hanabook`, `hotmanga`, `japscanst`, `kanakonohast`, `komiko`, `mangadraftst`, `mangahubfr`, `mangaplexe`, `mangasoriginesfr`, `mangasoriginesst`, `onlyyaoiscantrad`, `onlyyuriscantrad`, `punkrecords`, `softepsilonscan`, `sushiscanst`, `twatt`, `universotakust`, `yureiscan`.
 
 #### Historique (31 Octobre 2026)
 
