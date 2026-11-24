@@ -19,7 +19,9 @@ import keiyoushi.utils.parseAs
 import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
 import okhttp3.Response
+import java.util.concurrent.TimeUnit
 
 @Source
 abstract class JapscanNeo :
@@ -27,6 +29,13 @@ abstract class JapscanNeo :
     ConfigurableSource {
 
     override val supportsLatest = true
+
+    private val apiClient: OkHttpClient by lazy {
+        client.newBuilder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .build()
+    }
 
     private val preferences: SharedPreferences by getPreferencesLazy()
 
@@ -56,7 +65,7 @@ abstract class JapscanNeo :
             }
         }.build()
         val response = try {
-            client.newCall(GET(url, requestHeaders)).awaitSuccess()
+            apiClient.newCall(GET(url, requestHeaders)).awaitSuccess()
         } catch (e: Exception) {
             val msg = e.message.orEmpty()
             if (msg.contains("401") || msg.contains("403")) {
@@ -85,7 +94,7 @@ abstract class JapscanNeo :
             SManga.create().apply {
                 this.url = "/api/manga/${item.slug}"
                 title = item.title
-                thumbnail_url = item.coverUrl
+                thumbnail_url = "$baseUrl/api/manga/${item.slug}/cover"
                 status = parseStatus(item.status)
             }
         }
@@ -103,7 +112,7 @@ abstract class JapscanNeo :
             SManga.create().apply {
                 this.url = "/api/manga/${item.mangaSlug}"
                 title = item.mangaTitle
-                thumbnail_url = item.coverUrl
+                thumbnail_url = "$baseUrl/api/manga/${item.mangaSlug}/cover"
             }
         }
         return MangasPage(mangas, updates.isNotEmpty())
@@ -120,7 +129,7 @@ abstract class JapscanNeo :
             SManga.create().apply {
                 this.url = "/api/manga/${item.slug}"
                 title = item.title
-                thumbnail_url = item.coverUrl
+                thumbnail_url = "$baseUrl/api/manga/${item.slug}/cover"
                 status = parseStatus(item.status)
             }
         }
