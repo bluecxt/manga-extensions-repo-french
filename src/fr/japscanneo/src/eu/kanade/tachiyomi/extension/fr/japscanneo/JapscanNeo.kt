@@ -67,14 +67,8 @@ abstract class JapscanNeo :
             throw Exception("API URL not configured: this extension is designed to work with a self-hosted proxy, contact the developer for more info.")
         }
 
-        val requestHeaders = headersBuilder().apply {
-            val token = apiKey
-            if (token.isNotBlank()) {
-                set("Authorization", "Bearer $token")
-            }
-        }.build()
         val response = try {
-            apiClient.newCall(GET(url, requestHeaders)).awaitSuccess()
+            apiClient.newCall(GET(url, headers)).awaitSuccess()
         } catch (e: Exception) {
             val msg = e.message.orEmpty()
             if (msg.contains("401") || msg.contains("403")) {
