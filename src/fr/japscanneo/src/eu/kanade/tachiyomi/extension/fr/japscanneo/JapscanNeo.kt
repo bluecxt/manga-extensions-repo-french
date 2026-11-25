@@ -175,7 +175,7 @@ abstract class JapscanNeo :
         } else {
             chapters
         }
-        return SMangaUpdate(details, chapterList)
+        return SMangaUpdate(details, chapterList.asReversed())
     }
 
     // Pages
