@@ -17,6 +17,7 @@ import keiyoushi.source.SMangaUpdate
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.Serializable
+import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
@@ -48,6 +49,14 @@ abstract class JapscanNeo :
 
     private val apiKey: String
         get() = preferences.getString(PREF_API_KEY, "")?.trim().orEmpty()
+
+    override fun Headers.Builder.configureHeaders(): Headers.Builder {
+        val token = apiKey
+        if (token.isNotBlank()) {
+            set("Authorization", "Bearer $token")
+        }
+        return this
+    }
 
     private suspend fun apiGet(url: HttpUrl): Response {
         val configuredUrl = preferences.getString(PREF_SERVER_URL, DEFAULT_SERVER_URL)
