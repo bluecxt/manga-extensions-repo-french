@@ -23,17 +23,69 @@ internal val ACLIB_STUB = """
 
 // Paginated mode: minimal createObjectURL capture. The descrambler surfaces each composited
 // page as a `blob:` URL, capturing the latest one per page-click is enough.
-internal val PAGINATED_HOOK = """
+internal fun paginatedHook(interfaceName: String) = $$"""
                                 (function(){
                                     if (window.__japscanHooked) return;
                                     window.__japscanHooked = true;
+                                    // Same logging channel as the long-strip hooks: without it every
+                                    // diagnostic emitted by the paginated driver was swallowed.
+                                    try {
+                                        var jl = window.$$interfaceName && window.$$interfaceName.log;
+                                        window.__jlog = jl
+                                            ? function(){ try { var p = []; for (var i = 0; i < arguments.length; i++) p.push(String(arguments[i])); window.$$interfaceName.log(p.join(' ')); } catch(e) {} }
+                                            : function(){ try { console.log.apply(console, arguments); } catch(e) {} };
+                                    } catch(e) { window.__jlog = function(){}; }
                                     window.__japscanLastBlob = null;
+                                    window.__japscanBlobs = window.__japscanBlobs || {};
+                                    // Diagnose how the reader builds its page image: a canvas re-encode
+                                    // would mean our capture inherits that quality loss.
+                                    try {
+                                        var _origToBlob = HTMLCanvasElement.prototype.toBlob;
+                                        HTMLCanvasElement.prototype.toBlob = function(cb, type, quality){
+                                            var self = this;
+                                            var wrapped = function(b){
+                                                try {
+                                                    window.__jlog('[japscan] canvas.toBlob ' + self.width + 'x' + self.height +
+                                                        ' type=' + (type || 'default') + ' q=' + (quality === undefined ? '-' : quality) +
+                                                        ' size=' + (b ? b.size : -1));
+                                                } catch(e) {}
+                                                return cb ? cb(b) : undefined;
+                                            };
+                                            return _origToBlob.call(this, wrapped, type, quality);
+                                        };
+                                        try {
+                                            HTMLCanvasElement.prototype.toBlob.toString = function(){
+                                                return 'function toBlob() { [native code] }';
+                                            };
+                                        } catch(e) {}
+                                    } catch(e) {}
                                     var _orig = URL.createObjectURL.bind(URL);
                                     URL.createObjectURL = function(obj){
                                         var u = _orig(obj);
                                         try {
                                             if (obj && obj.type && /^image\//.test(obj.type)) {
                                                 window.__japscanLastBlob = u;
+                                                // Keep the Blob itself: reading it directly skips the
+                                                // ~150 ms blob: fetch before every page.
+                                                window.__japscanLastBlobObj = obj;
+                                                // Cheap page counter the driver can poll without
+                                                // touching the Blob.
+                                                window.__japscanCreated = (window.__japscanCreated || 0) + 1;
+                                                // Hand the page over the moment it exists: the driver
+                                                // encodes it and the Blob is released, so a 195-page
+                                                // chapter never sits on the JS heap. Until the driver
+                                                // arms the pump, the blob is parked for it to drain.
+                                                try {
+                                                    if (window.__japscanPump) window.__japscanPump(obj);
+                                                    else window.__japscanBlobs[u] = obj;
+                                                } catch(e) {}
+                                                try {
+                                                    window.__japscanSeen = (window.__japscanSeen || 0) + 1;
+                                                    if (window.__japscanSeen <= 3 || window.__japscanSeen % 25 === 0) {
+                                                        window.__jlog('[japscan] page ' + window.__japscanSeen +
+                                                            ' blob type=' + obj.type + ' size=' + obj.size);
+                                                    }
+                                                } catch(e) {}
                                             }
                                         } catch(e) {}
                                         return u;
@@ -246,7 +298,7 @@ internal fun webtoonHooks(interfaceName: String) = $$"""
                             })();
 """.trimIndent()
 
-internal fun paginatedDriver(interfaceName: String) = $$"""
+internal fun paginatedDriver(interfaceName: String, uploadUrl: String) = $$"""
                                 (async function(){
                                     // onPageFinished fires more than once per load (redirects,
                                     // iframes, in-page navigations). Without this guard a second
@@ -254,55 +306,46 @@ internal fun paginatedDriver(interfaceName: String) = $$"""
                                     if (window.__japscanDriverStarted) return;
                                     window.__japscanDriverStarted = true;
                                     var sleep = function(ms){ return new Promise(function(r){ setTimeout(r, ms); }); };
-
-                                    async function saveBlobUrl(u){
-                                        if (!u) return false;
-                                        try {
-                                            var r = await fetch(u);
-                                            var b = await r.blob();
-                                            var d = await new Promise(function(res, rej){
-                                                var fr = new FileReader();
-                                                fr.onload = function(){ res(fr.result); };
-                                                fr.onerror = rej;
-                                                fr.readAsDataURL(b);
-                                            });
-                                            if (typeof d === 'string' && d.indexOf('data:image/') === 0) {
-                                                window.$$interfaceName.savePage(d);
-                                                return true;
-                                            }
-                                        } catch(e) {
-                                            console.log('[japscan] saveBlobUrl failed: ' + e);
-                                        } finally {
-                                            try { URL.revokeObjectURL(u); } catch(e) {}
-                                        }
-                                        return false;
-                                    }
-
-                                    async function waitForBlob(timeoutMs){
-                                        var w = 0;
-                                        while (!window.__japscanLastBlob && w < timeoutMs) {
-                                            await sleep(100); w += 100;
-                                        }
-                                        if (!window.__japscanLastBlob) return -1;
-                                        var lastUrl = window.__japscanLastBlob;
-                                        var stable = 0;
-                                        while (stable < 400) {
-                                            await sleep(100);
-                                            if (window.__japscanLastBlob !== lastUrl) {
-                                                lastUrl = window.__japscanLastBlob;
-                                                stable = 0;
-                                            } else {
-                                                stable += 100;
-                                            }
-                                        }
-                                        return w;
-                                    }
-
-                                    var sel = document.getElementById('pages');
-                                    var total = sel ? sel.options.length : 1;
+                                    // Loopback receiver URL, empty when it could not be started. Any
+                                    // upload failure permanently falls back to the bridge.
+                                    var uploadBase = "$$uploadUrl";
+                                    var withTimeout = function(p, ms){
+                                        return Promise.race([p, new Promise(function(_, rej){
+                                            setTimeout(function(){ rej(new Error('upload timeout')); }, ms);
+                                        })]);
+                                    };
                                     var nextBtn = document.getElementById('block-right');
                                     var prevBtn = document.getElementById('block-left');
-                                    console.log('[japscan] paginated mode, total = ' + total + ', next=' + !!nextBtn + ', prev=' + !!prevBtn);
+                                    // Upper bound for the page cap when the reader publishes no count.
+                                    var MAX_PAGES = 500;
+
+                                    // The reader populates #pages from its own bootstrap, which can land
+                                    // after onPageFinished. Reading it too early reported total = 0 and
+                                    // gave up on a chapter that was merely still mounting.
+                                    var sel = null;
+                                    for (var mount = 0; mount < 80; mount++) {
+                                        sel = document.getElementById('pages');
+                                        if (sel && sel.options && sel.options.length > 0) break;
+                                        sel = null;
+                                        // Pages already rendering mean the reader is mounted, page
+                                        // count or not: stop waiting and let the pump start.
+                                        if (created() > 0) break;
+                                        if (mount === 30) {
+                                            window.__jlog('[japscan] still mounting: selects=' +
+                                                document.querySelectorAll('select').length +
+                                                ' pagesEl=' + !!document.getElementById('pages') +
+                                                ' title=' + document.title);
+                                        }
+                                        await sleep(100);
+                                    }
+                                    // expected = 0 means the reader never published a page count. That is
+                                    // not "zero pages": the reader still composites them and the hook
+                                    // still sees every one, so the capture runs without the count.
+                                    var expected = sel ? sel.options.length : 0;
+                                    var total = expected || MAX_PAGES;
+                                    window.__jlog('[japscan] paginated mode, total = ' + (expected || 'unknown') +
+                                        ', next=' + !!nextBtn + ', prev=' + !!prevBtn +
+                                        ', title=' + document.title);
 
                                     function nav(btn, fallbackKey){
                                         try {
@@ -314,19 +357,243 @@ internal fun paginatedDriver(interfaceName: String) = $$"""
                                                 bubbles: true,
                                             }));
                                         } catch(e) {
-                                            console.log('[japscan] nav failed: ' + e);
+                                            window.__jlog('[japscan] nav failed: ' + e);
                                         }
                                     }
 
-                                    // The reader pre-renders pages on load (the final pre-render is
-                                    // the *last* page, not page 1), so the very first blob the hook
-                                    // sees is unreliable. Wait for the pre-render to settle, discard
-                                    // whatever was captured, then bounce next->prev to force a clean
-                                    // page-1 render before we start harvesting.
+                                    function created(){ return window.__japscanCreated || 0; }
+
+                                    async function waitCreated(min, timeoutMs){
+                                        var w = 0;
+                                        while (created() < min && w < timeoutMs) {
+                                            await sleep(50); w += 50;
+                                        }
+                                        return created() >= min;
+                                    }
+
+                                    // ---- push at creation ---------------------------------------------
+                                    // The reader composites each page onto a canvas and hands the
+                                    // result to URL.createObjectURL as an image/jpeg Blob. The hook
+                                    // forwards every Blob here the instant it is created, so pages are
+                                    // harvested without any navigation, and the Blob can be released
+                                    // right away instead of being kept on the JS heap.
                                     //
-                                    // waitForBlob already means "a blob arrived and stopped changing
-                                    // for 400ms", which is exactly the settle condition — a fixed
-                                    // sleep was both slower here and too short on a loaded device.
+                                    // Call order IS page order: the reader renders page N+1 before
+                                    // showing it, and the hook preserves creation order.
+                                    //
+                                    // The chain is deliberately sequential: a 3-deep FileReader
+                                    // pipeline was measured at 9.7s against 9.3s here, because the
+                                    // encode (11ms) is already hidden behind the reader's own render
+                                    // (48ms/page) and only the bridge call defines the order.
+                                    var pumped = 0;
+                                    var sumRead = 0;
+                                    var sumBridge = 0;
+                                    var sumUpload = 0;
+                                    var seen = (typeof WeakSet === 'function') ? new WeakSet() : null;
+                                    var chain = Promise.resolve();
+                                    // The reader creates the blob of a page twice on some renders
+                                    // (the same bytes, a few ms apart). Keeping both shifts every
+                                    // following page by one, so an exact repeat is dropped.
+                                    var lastSize = -1;
+                                    var lastData = null;
+
+                                    function encode(blob){
+                                        return new Promise(function(res, rej){
+                                            var fr = new FileReader();
+                                            fr.onload = function(){ res(fr.result); };
+                                            fr.onerror = rej;
+                                            fr.readAsDataURL(blob);
+                                        });
+                                    }
+
+                                    function push(blob){
+                                        if (!blob || !blob.size) return;
+                                        // A repeat consumes an index too: leaving no margin here
+                                        // dropped the last real page of every chapter.
+                                        if (pumped >= total + 8) return;
+                                        if (seen) { if (seen.has(blob)) return; seen.add(blob); }
+                                        chain = chain.then(async function(){
+                                            // A repeat upload consumes an index, so the cap must
+                                            // leave room or the last real page is never sent.
+                                            if (pumped >= total + 8) return;
+                                            try {
+                                                // A local socket carries the raw JPEG: no base64,
+                                                // no 750 KB string across the bridge. The index in
+                                                // the URL carries the page order.
+                                                if (uploadBase) {
+                                                    try {
+                                                        var u0 = Date.now();
+                                                        var resp = await withTimeout(
+                                                            fetch(uploadBase + '/page/' + (pumped + 1), { method: 'POST', body: blob }),
+                                                            5000,
+                                                        );
+                                                        var u1 = Date.now();
+                                                        if (!resp || !resp.ok) throw new Error('HTTP ' + (resp && resp.status));
+                                                        pumped++;
+                                                        sumUpload += u1 - u0;
+                                                        if (pumped % 25 === 0) {
+                                                            window.__jlog('[japscan] socket page ' + pumped + ' ' +
+                                                                (u1 - u0) + 'ms size=' + blob.size);
+                                                        }
+                                                        return;
+                                                    } catch(e) {
+                                                        window.__jlog('[japscan] socket upload failed, using the bridge: ' + e);
+                                                        uploadBase = '';
+                                                    }
+                                                }
+                                                var t0 = Date.now();
+                                                var d = await encode(blob);
+                                                var t1 = Date.now();
+                                                if (typeof d !== 'string' || d.indexOf('data:image/') !== 0) return;
+                                                if (blob.size === lastSize && d === lastData) {
+                                                    window.__jlog('[japscan] duplicate page skipped (size=' + blob.size + ')');
+                                                    return;
+                                                }
+                                                lastSize = blob.size;
+                                                lastData = d;
+                                                window.$$interfaceName.savePage(d.substring(d.indexOf(',') + 1));
+                                                var t2 = Date.now();
+                                                pumped++;
+                                                sumRead += t1 - t0;
+                                                sumBridge += t2 - t1;
+                                                if (pumped % 25 === 0) {
+                                                    window.__jlog('[japscan] pump page ' + pumped + ' read=' + (t1 - t0) +
+                                                        'ms bridge=' + (t2 - t1) + 'ms size=' + blob.size);
+                                                }
+                                            } catch(e) {
+                                                window.__jlog('[japscan] pump failed: ' + e);
+                                            }
+                                        });
+                                    }
+                                    window.__japscanPump = push;
+
+                                    // Pages the reader rendered before this driver ran.
+                                    try {
+                                        var already = Object.keys(window.__japscanBlobs || {});
+                                        for (var ai = 0; ai < already.length; ai++) {
+                                            push(window.__japscanBlobs[already[ai]]);
+                                            delete window.__japscanBlobs[already[ai]];
+                                        }
+                                        window.__jlog('[japscan] pump armed with ' + already.length + ' pre-rendered page(s)');
+                                    } catch(e) {}
+
+                                    // ---- harvest ------------------------------------------------------
+                                    // Wait for the pre-render to stop producing pages instead of
+                                    // clicking blindly: the reader renders ahead of the visible page.
+                                    var mark = created();
+                                    for (var s = 0; s < 60; s++) {
+                                        await sleep(500);
+                                        var now = created();
+                                        if (now === mark) break;
+                                        mark = now;
+                                    }
+                                    await chain;
+                                    window.__jlog('[japscan] pre-render settled: ' + pumped + ' / ' + (expected || '?') +
+                                        ' page(s), created=' + created());
+
+                                    // Pre-rendering is windowed on long chapters: walk forward so the
+                                    // reader composites the rest. The wait is the reader's own debounce,
+                                    // and the encode of the previous page runs meanwhile.
+                                    if (expected > 0) {
+                                        var stalls = 0;
+                                        for (var i = 1; i < expected && created() < expected && stalls < 12; i++) {
+                                            var before = created();
+                                            nav(nextBtn, 'ArrowRight');
+                                            if (await waitCreated(before + 1, 900)) stalls = 0; else stalls++;
+                                        }
+                                        await chain;
+                                    }
+                                    window.__jlog('[japscan] walk done: ' + pumped + ' / ' + (expected || '?') +
+                                        ' page(s), created=' + created());
+
+                                    // Complete when every announced page is in, or, with no count, when
+                                    // the reader stopped producing pages at all.
+                                    var complete = expected > 0 ? pumped >= expected - 1 : pumped > 0;
+                                    if (complete) {
+                                        window.__jlog('[japscan] done (pump), ' + pumped + ' / ' + (expected || '?') + ' pages saved, upload_avg=' +
+                                            (pumped ? Math.round(sumUpload / pumped) : 0) + 'ms read_avg=' +
+                                            (pumped ? Math.round(sumRead / pumped) : 0) + 'ms bridge_avg=' +
+                                            (pumped ? Math.round(sumBridge / pumped) : 0) + 'ms');
+                                        try { window.$$interfaceName.passDone(); } catch(e) {}
+                                        return;
+                                    }
+
+                                    // ---- fallback -----------------------------------------------------
+                                    // The pump did not cover the chapter (unexpected render order or a
+                                    // page the reader never composites). Throw the partial harvest away
+                                    // and replay the click loop, which captures strictly in page order.
+                                    if (expected === 0) {
+                                        // The click loop walks the page list, so it cannot run without
+                                        // one. Keep what the reader rendered.
+                                        window.__jlog('[japscan] no page count, keeping the ' + pumped + ' rendered page(s)');
+                                        try { window.$$interfaceName.passDone(); } catch(e) {}
+                                        return;
+                                    }
+                                    window.__jlog('[japscan] pump incomplete (' + pumped + ' / ' + expected + '), fallback to the click loop');
+                                    window.__japscanPump = null;
+                                    try { window.$$interfaceName.resetPages(); } catch(e) {}
+                                    pumped = 0;
+
+                                    async function saveBlobUrl(u){
+                                        if (!u) return false;
+                                        try {
+                                            var t0 = Date.now();
+                                            var b = window.__japscanLastBlobObj;
+                                            if (!b) {
+                                                var r = await fetch(u);
+                                                b = await r.blob();
+                                            }
+                                            var t1 = Date.now();
+                                            var d = await new Promise(function(res, rej){
+                                                var fr = new FileReader();
+                                                fr.onload = function(){ res(fr.result); };
+                                                fr.onerror = rej;
+                                                fr.readAsDataURL(b);
+                                            });
+                                            var t2 = Date.now();
+                                            if (typeof d === 'string' && d.indexOf('data:image/') === 0) {
+                                                window.$$interfaceName.savePage(d.substring(d.indexOf(',') + 1));
+                                                var t3 = Date.now();
+                                                window.__jlog('[japscan] saveBlob fetch=' + (t1 - t0) +
+                                                    'ms read=' + (t2 - t1) + 'ms bridge=' + (t3 - t2) +
+                                                    'ms chars=' + d.length);
+                                                return true;
+                                            }
+                                        } catch(e) {
+                                            window.__jlog('[japscan] saveBlobUrl failed: ' + e);
+                                        } finally {
+                                            try { URL.revokeObjectURL(u); } catch(e) {}
+                                            if (window.__japscanLastBlob === u) {
+                                                window.__japscanLastBlob = null;
+                                                window.__japscanLastBlobObj = null;
+                                            }
+                                        }
+                                        return false;
+                                    }
+
+                                    async function waitForBlob(timeoutMs){
+                                        var w = 0;
+                                        while (!window.__japscanLastBlob && w < timeoutMs) {
+                                            await sleep(100); w += 100;
+                                        }
+                                        if (!window.__japscanLastBlob) return -1;
+                                        // The hook overwrites __japscanLastBlob as soon as the reader
+                                        // composites a page. A 400 ms quiet window cost ~35 % of the
+                                        // per-page time; 150 ms is enough to let the last tile land.
+                                        var lastUrl = window.__japscanLastBlob;
+                                        var stable = 0;
+                                        while (stable < 150) {
+                                            await sleep(50);
+                                            if (window.__japscanLastBlob !== lastUrl) {
+                                                lastUrl = window.__japscanLastBlob;
+                                                stable = 0;
+                                            } else {
+                                                stable += 50;
+                                            }
+                                        }
+                                        return w;
+                                    }
+
                                     await waitForBlob(10000);
                                     window.__japscanLastBlob = null;
 
@@ -338,27 +605,31 @@ internal fun paginatedDriver(interfaceName: String) = $$"""
                                     var t0 = await waitForBlob(8000);
                                     var u0 = window.__japscanLastBlob;
                                     window.__japscanLastBlob = null;
-                                    if (total > 1) nav(nextBtn, 'ArrowRight');
+                                    if (expected > 1) nav(nextBtn, 'ArrowRight');
                                     var saved = u0 ? ((await saveBlobUrl(u0)) ? 1 : 0) : 0;
-                                    console.log('[japscan] page 1 captured after ' + t0 + 'ms (saved=' + saved + ')');
+                                    window.__jlog('[japscan] page 1 captured after ' + t0 + 'ms (saved=' + saved + ')');
 
-                                    for (var i = 1; i < total; i++) {
+                                    for (var j = 1; j < expected; j++) {
                                         var t = await waitForBlob(8000);
                                         var u = window.__japscanLastBlob;
                                         window.__japscanLastBlob = null;
-                                        if (i < total - 1) nav(nextBtn, 'ArrowRight');
+                                        if (j < expected - 1) nav(nextBtn, 'ArrowRight');
                                         var ok = u ? await saveBlobUrl(u) : false;
                                         if (ok) saved++;
-                                        console.log('[japscan] page ' + (i + 1) + ' captured after ' + t + 'ms (saved=' + saved + ')');
+                                        window.__jlog('[japscan] page ' + (j + 1) + ' captured after ' + t + 'ms (saved=' + saved + ')');
                                     }
 
-                                    console.log('[japscan] done, ' + saved + ' / ' + total + ' pages saved');
+                                    window.__jlog('[japscan] done (click loop), ' + saved + ' / ' + expected + ' pages saved');
                                     try {
                                         window.$$interfaceName.passDone();
                                     } catch(e) {
-                                        console.log('[japscan] passDone failed: ' + e);
+                                        window.__jlog('[japscan] passDone failed: ' + e);
                                     }
-                                })();
+                                })().catch(function(e){
+                                    // A throw anywhere in this coroutine used to be silent: the
+                                    // chapter was captured but never reported as done.
+                                    try { window.__jlog('[japscan] driver crashed: ' + (e && e.message ? e.message : e)); } catch(_) {}
+                                });
 """.trimIndent()
 
 internal fun webtoonDriver(interfaceName: String, urlSegment: String) = $$"""
@@ -531,9 +802,48 @@ internal fun webtoonDriver(interfaceName: String, urlSegment: String) = $$"""
 
                                 function tileToDataUri(tile){
                                     try {
+                                        if (!window.__japscanImgProbe) {
+                                            window.__japscanImgProbe = true;
+                                            try {
+                                                var imgs = Array.prototype.slice.call(document.images || []);
+                                                var dataCount = imgs.filter(function(i){
+                                                    return (i.currentSrc || i.src || '').indexOf('data:image/') === 0;
+                                                }).length;
+                                                var blobCount = imgs.filter(function(i){
+                                                    return (i.currentSrc || i.src || '').indexOf('blob:') === 0;
+                                                }).length;
+                                                var httpCount = imgs.filter(function(i){
+                                                    return /^https?:/.test(i.currentSrc || i.src || '');
+                                                }).length;
+                                                var lists = document.querySelectorAll('ss-list');
+                                                var listInfo = 'none';
+                                                if (lists.length > 0) {
+                                                    var first = lists[0];
+                                                    var kids = Array.prototype.slice.call(first.children || []);
+                                                    var biggest = null;
+                                                    var biggestArea = 0;
+                                                    for (var k = 0; k < kids.length; k++) {
+                                                        var r = kids[k].getBoundingClientRect();
+                                                        var area = r.width * r.height;
+                                                        if (area > biggestArea) { biggestArea = area; biggest = kids[k]; }
+                                                    }
+                                                    var canvasTotal = first.querySelectorAll('canvas').length;
+                                                    var imgTotal = first.querySelectorAll('img').length;
+                                                    listInfo = lists.length + 'x kids=' + kids.length +
+                                                        ' canvases=' + canvasTotal + ' imgs=' + imgTotal +
+                                                        ' biggest=' + (biggest ? (biggest.tagName + '.' + (biggest.className || '')) : 'none') +
+                                                        ' area=' + Math.round(biggestArea);
+                                                }
+                                                window.__jlog('[japscan] probe: imgs total=' + imgs.length + ' data=' + dataCount +
+                                                    ' blob=' + blobCount + ' http=' + httpCount + ' | ss-list ' + listInfo);
+                                            } catch(e) {}
+                                        }
                                         var c = pickTileCanvas(tile);
                                         if (!c || !c.width || !c.height) return null;
-                                        return c.toDataURL('image/jpeg', 0.92);
+                                        var t0 = Date.now();
+                                        var uri = c.toDataURL('image/jpeg', 0.92);
+                                        window.__japscanEncodeMs = (window.__japscanEncodeMs || 0) + (Date.now() - t0);
+                                        return uri;
                                     } catch(e) { return null; }
                                 }
 
@@ -598,11 +908,13 @@ internal fun webtoonDriver(interfaceName: String, urlSegment: String) = $$"""
                                             var uri = tileToDataUri(tile);
                                             if (!uri) continue;
                                             try {
-                                                window.$$interfaceName.savePage(uri);
+                                                var tBridge = Date.now();
+                                                window.$$interfaceName.savePage(uri.substring(uri.indexOf(',') + 1));
+                                                var bridgeMs = Date.now() - tBridge;
                                                 savedHosts.add(tile.host);
                                                 saved++;
                                                 tilesEmitted++;
-                                                window.__jlog('[japscan] ' + pageLabel + ' tile #' + savedHosts.size + ' saved (' + picked.width + 'x' + picked.height + ', ' + uri.length + ' chars)');
+                                                window.__jlog('[japscan] ' + pageLabel + ' tile #' + savedHosts.size + ' saved (' + picked.width + 'x' + picked.height + ', ' + uri.length + ' chars, bridge=' + bridgeMs + 'ms, encodeTotal=' + window.__japscanEncodeMs + 'ms)');
                                             } catch(e) {
                                                 window.__jlog('[japscan] ' + pageLabel + ' savePage failed: ' + e);
                                             }

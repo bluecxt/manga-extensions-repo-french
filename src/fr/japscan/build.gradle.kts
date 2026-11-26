@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "Japscan"
-    versionCode = 75 // upstream: none
+    versionCode = 76 // upstream: none
     contentWarning = ContentWarning.SAFE
     libVersion = "1.6"
 
@@ -15,8 +15,4 @@ keiyoushi {
         baseUrl = "https://www.japscan.foo"
         id = 11L
     }
-}
-
-dependencies {
-    implementation(project(":lib:twocaptcha"))
 }

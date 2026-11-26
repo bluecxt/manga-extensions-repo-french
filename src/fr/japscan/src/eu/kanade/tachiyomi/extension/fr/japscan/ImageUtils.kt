@@ -6,28 +6,53 @@ import android.util.Base64
 import kotlin.math.abs
 
 fun decodeBase64ToImage(b64: String): Bitmap {
-    val cleanB64 = if (b64.contains(",")) b64.substringAfter(",") else b64
+    // One scan for the header separator instead of contains() + substringAfter().
+    val comma = b64.indexOf(',')
+    val cleanB64 = if (comma >= 0) b64.substring(comma + 1) else b64
     val bytes = Base64.decode(cleanB64.replace("\\", ""), Base64.DEFAULT)
     return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+}
+
+private const val NOISE_THRESHOLD = 45.0
+
+/**
+ * Mean absolute per-channel difference between two rows of [bitmap].
+ *
+ * Both rows are read with a single [Bitmap.getPixels] call: [Bitmap.getPixel] is a bounds-checked
+ * JNI call per pixel, and this probe used to make ~6000 of them per image.
+ */
+private fun rowDifference(
+    bitmap: Bitmap,
+    firstRow: Int,
+    secondRow: Int,
+    width: Int,
+    first: IntArray,
+    second: IntArray,
+): Double {
+    bitmap.getPixels(first, 0, width, 0, firstRow, width, 1)
+    bitmap.getPixels(second, 0, width, 0, secondRow, width, 1)
+    var diffSum = 0L
+    for (x in 0 until width) {
+        val p1 = first[x]
+        val p2 = second[x]
+        diffSum += abs(((p1 shr 16) and 0xFF) - ((p2 shr 16) and 0xFF))
+        diffSum += abs(((p1 shr 8) and 0xFF) - ((p2 shr 8) and 0xFF))
+        diffSum += abs((p1 and 0xFF) - (p2 and 0xFF))
+    }
+    return diffSum.toDouble() / (width * 3)
 }
 
 // Detect thickness of random rainbow noise border (typically 3-7px)
 fun detectNoiseBorder(bitmap: Bitmap): Pair<Int, Int> {
     val h = bitmap.height
     val w = bitmap.width
+    val scan = minOf(10, h - 1)
+    val first = IntArray(w)
+    val second = IntArray(w)
 
     var topNoise = 0
-    for (r in 0 until minOf(10, h - 1)) {
-        var diffSum: Long = 0
-        for (x in 0 until w) {
-            val p1 = bitmap.getPixel(x, r)
-            val p2 = bitmap.getPixel(x, r + 1)
-            diffSum += abs(((p1 shr 16) and 0xFF) - ((p2 shr 16) and 0xFF))
-            diffSum += abs(((p1 shr 8) and 0xFF) - ((p2 shr 8) and 0xFF))
-            diffSum += abs((p1 and 0xFF) - (p2 and 0xFF))
-        }
-        val avgDiff = diffSum.toDouble() / (w * 3)
-        if (avgDiff > 45.0) {
+    for (r in 0 until scan) {
+        if (rowDifference(bitmap, r, r + 1, w, first, second) > NOISE_THRESHOLD) {
             topNoise = r + 1
         } else {
             break
@@ -35,17 +60,8 @@ fun detectNoiseBorder(bitmap: Bitmap): Pair<Int, Int> {
     }
 
     var botNoise = 0
-    for (r in 0 until minOf(10, h - 1)) {
-        var diffSum: Long = 0
-        for (x in 0 until w) {
-            val p1 = bitmap.getPixel(x, h - 1 - r)
-            val p2 = bitmap.getPixel(x, h - 2 - r)
-            diffSum += abs(((p1 shr 16) and 0xFF) - ((p2 shr 16) and 0xFF))
-            diffSum += abs(((p1 shr 8) and 0xFF) - ((p2 shr 8) and 0xFF))
-            diffSum += abs((p1 and 0xFF) - (p2 and 0xFF))
-        }
-        val avgDiff = diffSum.toDouble() / (w * 3)
-        if (avgDiff > 45.0) {
+    for (r in 0 until scan) {
+        if (rowDifference(bitmap, h - 1 - r, h - 2 - r, w, first, second) > NOISE_THRESHOLD) {
             botNoise = r + 1
         } else {
             break
@@ -63,6 +79,11 @@ fun edgeDifference(top: Bitmap, bottom: Bitmap): Long {
     val bottomY = t2
     val w = minOf(top.width, bottom.width)
 
+    val topRow = IntArray(w)
+    val botRow = IntArray(w)
+    top.getPixels(topRow, 0, w, 0, topY, w, 1)
+    bottom.getPixels(botRow, 0, w, 0, bottomY, w, 1)
+
     var colorDiff: Long = 0
     val topGrad = LongArray(w - 1)
     val botGrad = LongArray(w - 1)
@@ -75,8 +96,8 @@ fun edgeDifference(top: Bitmap, bottom: Bitmap): Long {
     var prevBotB = 0
 
     for (x in 0 until w) {
-        val pxTop = top.getPixel(x, topY)
-        val pxBottom = bottom.getPixel(x, bottomY)
+        val pxTop = topRow[x]
+        val pxBottom = botRow[x]
 
         val r1 = (pxTop shr 16) and 0xFF
         val g1 = (pxTop shr 8) and 0xFF
@@ -180,8 +201,12 @@ fun findBestVerticalOrder(cost: Array<LongArray>, heights: List<Int>): List<Int>
 fun orderUuidsByImageVerticality(items: List<Pair<String, String>>): List<String> {
     require(items.size == 4) { "Exactly 4 Base64 segments are required." }
     val bitmaps = items.map { (_, src) -> decodeBase64ToImage(src) }
-    val heights = bitmaps.map { it.height }
-    val cost = computeCostMatrix(bitmaps)
-    val orderIndex = findBestVerticalOrder(cost, heights)
-    return orderIndex.map { items[it].first }
+    try {
+        val heights = bitmaps.map { it.height }
+        val cost = computeCostMatrix(bitmaps)
+        return findBestVerticalOrder(cost, heights).map { items[it].first }
+    } finally {
+        // Each slice is ~0.6 MB of native memory and is dead once the ordering is known.
+        bitmaps.forEach { it.recycle() }
+    }
 }

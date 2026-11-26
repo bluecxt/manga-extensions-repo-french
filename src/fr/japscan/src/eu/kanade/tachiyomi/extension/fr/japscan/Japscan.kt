@@ -7,7 +7,9 @@ import android.graphics.Bitmap
 import android.util.Base64
 import android.util.Log
 import android.view.View
+import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
+import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -21,29 +23,27 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
-import keiyoushi.lib.twocaptcha.TwoCaptcha
 import keiyoushi.network.Fetch
 import keiyoushi.network.get
-import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.source.SMangaUpdate
 import keiyoushi.utils.applicationContext
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferencesLazy
-import keiyoushi.utils.parseAs
 import keiyoushi.utils.runWebView
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParseDate
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.CacheControl
-import okhttp3.FormBody
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -56,16 +56,40 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
 import java.io.File
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Collections
 import java.util.Locale
+import kotlin.coroutines.resume
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeSource
+
+/**
+ * [runCatching] with coroutine cancellation rethrown.
+ *
+ * Swallowing a [CancellationException] turns a cancelled job into a silent failure: the capture
+ * keeps running against a WebView that is being destroyed, and the caller never learns that its
+ * job was cancelled.
+ */
+private inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (e: CancellationException) {
+    throw e
+} catch (e: Throwable) {
+    Result.failure(e)
+}
 
 @Source
 abstract class Japscan :
@@ -77,11 +101,13 @@ abstract class Japscan :
     // Pages are captured from the reader's canvases and spooled to the cache dir; their imageUrl
     // points at a sentinel host that this interceptor serves from disk, ahead of the rate limiter.
     override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = apply {
-        addInterceptor(TwoCaptcha.createCloudflareInterceptor(::twoCaptchaApiKey))
         addInterceptor { chain ->
             val request = chain.request()
             if (request.url.host != CACHE_HOST) return@addInterceptor chain.proceed(request)
-            val bytes = File("/" + request.url.pathSegments.joinToString("/")).takeIf(File::exists)?.readBytes()
+            // encodedPath is exactly what imageUrl carried: no pathSegments list, no join, and a
+            // single existence check instead of two.
+            val file = File(request.url.encodedPath)
+            val bytes = if (file.exists()) file.readBytes() else null
             Response.Builder()
                 .request(request)
                 .protocol(Protocol.HTTP_1_1)
@@ -93,8 +119,6 @@ abstract class Japscan :
         rateLimit(1, 2.seconds)
     }
 
-    private fun twoCaptchaApiKey(): String = preferences.getString(TWOCAPTCHA_API_KEY, "")?.trim().orEmpty()
-
     // Sometimes an adblock blocker will pop up, preventing the user from opening
     // a cloudflare protected page
     override fun getHomeUrl() = "$baseUrl/mangas/?sort=popular&p=1"
@@ -104,7 +128,7 @@ abstract class Japscan :
     override suspend fun getLatestUpdates(page: Int) = parseMangaList(client.get("$baseUrl/mangas/?sort=updated&p=$page", Fetch.NONE).asJsoup())
 
     private fun parseMangaList(document: Document): MangasPage {
-        val mangas = document.select(".mangas-list .manga-block:not(:has(a[href='']))").map { element ->
+        val mangas = document.select(".manga-block:not(:has(a[href='']))").map { element ->
             SManga.create().apply {
                 element.selectFirst("a")!!.let {
                     setUrlWithoutDomain(it.absUrl("href"))
@@ -119,11 +143,26 @@ abstract class Japscan :
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         if (query.isBlank()) return getPopularManga(page)
-        val body = FormBody.Builder().add("search", query).build()
-        val searchHeaders = headers.newBuilder().add("X-Requested-With", "XMLHttpRequest").build()
-        val results = client.post("$baseUrl/ls/", searchHeaders, Fetch.NONE, body).parseAs<List<SearchResultDto>>()
-        return MangasPage(results.map { it.toSManga(baseUrl) }, false)
+
+        // Two catalogues, two listings: /mangas/ holds manga, manhwa and manhua while /bds/ is the
+        // Bande Dessinée catalogue. Both use the same markup and accept ?search=, so query both and
+        // de-duplicate, exactly like the server does.
+        val mangas = parseMangaList(
+            client.get(searchUrl("mangas", query, page), Fetch.NONE).asJsoup(),
+        )
+        val bds = runCatchingCancellable {
+            parseMangaList(client.get(searchUrl("bds", query, page), Fetch.NONE).asJsoup())
+        }.getOrNull()
+
+        val items = (mangas.mangas + (bds?.mangas ?: emptyList())).distinctBy { it.url }
+        return MangasPage(items, mangas.hasNextPage || bds?.hasNextPage == true)
     }
+
+    /** Builds a `/<catalogue>/?search=…&p=…` listing URL for [catalogue]. */
+    private fun searchUrl(catalogue: String, query: String, page: Int): HttpUrl = "$baseUrl/$catalogue/".toHttpUrl().newBuilder()
+        .addQueryParameter("search", query)
+        .addQueryParameter("p", page.toString())
+        .build()
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
         if (url.host != baseUrl.toHttpUrl().host) return null
@@ -208,6 +247,7 @@ abstract class Japscan :
         if (el.hasClass("d-none")) return true
         if (el.hasAttr("hidden")) return true
         if (el.attr("aria-hidden").equals("true", ignoreCase = true)) return true
+        if (!el.hasAttr("style")) return false
         val style = el.attr("style").replace(" ", "").lowercase()
         return HIDDEN_STYLE_TOKENS.any { style.contains(it) } || HIDDEN_STYLE_REGEX.containsMatchIn(style)
     }
@@ -269,43 +309,121 @@ abstract class Japscan :
         val context = applicationContext
         val chapterUrl = baseUrl + chapter.url
         sweepPageCache(context.cacheDir)
+        Log.d("JapscanReader", "getPageList start: url=$chapterUrl isReader=$isReader")
 
-        solveCaptcha(chapterUrl, isReader)
+        // cachedPageList only returns an entry whose files are still spooled and that is younger
+        // than PAGE_LIST_CACHE_TTL_MS, and rememberPageList only stores a completed capture, so a
+        // hit is always a full chapter.
+        cachedPageList(chapterUrl)?.let { paths ->
+            Log.d("JapscanReader", "getPageList cache hit: ${paths.size} pages for $chapterUrl")
+            return paths.mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
+        }
 
-        // manhwa/manhua use the long-strip reader, everything else the paginated one. The DOM
-        // can't tell them apart before the reader JS mounts, and both need different hooks.
+        val requested = chapterUrl.toHttpUrl()
+        val probe = probeChapter(chapterUrl)
+        checkChapterRedirect(requested, probe.finalUrl)
+        solveCaptcha(chapterUrl, probe.captchaUp, isReader)
+        Log.d("JapscanReader", "captcha step done for $chapterUrl")
+
+        // manhwa/manhua usually use the long-strip reader, everything else the paginated one, but
+        // the URL segment is only a hint: some manhua chapters mount the paginated reader. The mode
+        // decides which hooks are installed before the page loads, so a mismatch is retried once
+        // with the other mode instead of returning an empty chapter.
         val urlSegment = chapter.url.trimStart('/').substringBefore('/').lowercase()
-        val isWebtoon = urlSegment == "manhwa" || urlSegment == "manhua"
-        val interfaceName = randomString()
-        val jsInterface = JsInterface(context.cacheDir)
-        val userAgent = headers["User-Agent"]
+        var isWebtoon = urlSegment == "manhwa" || urlSegment == "manhua"
 
-        val webView = withContext(Dispatchers.Main) {
-            createReaderWebView(chapterUrl, isWebtoon, urlSegment, interfaceName, jsInterface, userAgent)
+        var (captured, completed) = capturePages(chapterUrl, urlSegment, isWebtoon)
+        if (captured.isEmpty()) {
+            // A first attempt can come back empty when the reader mounted late (slow page,
+            // challenge still settling). Retry the SAME mode before assuming the mode is wrong:
+            // switching to the other hooks on a paginated DOM makes the driver give up by design.
+            Log.w("JapscanReader", "no page captured with webtoon=$isWebtoon, retrying the same mode")
+            delay(2.seconds)
+            val sameMode = capturePages(chapterUrl, urlSegment, isWebtoon)
+            captured = sameMode.first
+            completed = sameMode.second
         }
-        try {
-            // A healthy long chapter can take minutes, but a wedged driver shouldn't burn the
-            // whole budget: give up when no page was saved for IDLE_TIMEOUT.
-            val deadline = TimeSource.Monotonic.markNow() + 3.minutes
-            while (!jsInterface.done.isCompleted && deadline.hasNotPassedNow()) {
-                withTimeoutOrNull(IDLE_TIMEOUT) { jsInterface.activity.receive() } ?: break
-            }
-        } finally {
-            withContext(NonCancellable + Dispatchers.Main) { webView.destroy() }
+        if (captured.isEmpty()) {
+            Log.w(
+                "JapscanReader",
+                "still no page with webtoon=$isWebtoon, retrying with webtoon=${!isWebtoon}",
+            )
+            isWebtoon = !isWebtoon
+            val otherMode = capturePages(chapterUrl, urlSegment, isWebtoon)
+            captured = otherMode.first
+            completed = otherMode.second
         }
 
-        if (!jsInterface.done.isCompleted) {
-            throw Exception("Erreur lors de la récupération des pages")
+        Log.d("JapscanReader", "getPageList end: captured=${captured.size} webtoon=$isWebtoon url=$chapterUrl")
+        // A partial capture must never be cached: serving 168 pages for a 195-page chapter for the
+        // next 15 minutes is worse than capturing it again.
+        if (captured.isNotEmpty() && completed) {
+            rememberPageList(chapterUrl, captured)
+        } else if (captured.isNotEmpty()) {
+            Log.w(
+                "JapscanReader",
+                "partial capture (${captured.size} pages, done=false), not cached: $chapterUrl",
+            )
         }
-        return jsInterface.snapshot().mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
+        if (captured.isEmpty()) {
+            Log.w("JapscanReader", "getPageList finished with zero page: $chapterUrl")
+            throw Exception("Aucune page trouvée pour ce chapitre (chapitre vide ou supprimé sur Japscan)")
+        }
+        return captured.mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
+    }
+
+    /** One GET of a chapter page: the URL it finally landed on, and whether a captcha is up. */
+    private data class ChapterProbe(val finalUrl: HttpUrl, val captchaUp: Boolean)
+
+    /**
+     * Fetches the chapter page once, for both checks that follow it. They used to be two requests
+     * of the same HTML, and the client's 2 s rate limit made each of them cost a full round trip
+     * for a single bit of information.
+     */
+    private suspend fun probeChapter(chapterUrl: String): ChapterProbe {
+        val response = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK)
+        val finalUrl = response.request.url
+        val body = response.use { it.body.string() }
+        return ChapterProbe(finalUrl, CAPTCHA_REGEX.containsMatchIn(body))
+    }
+
+    /**
+     * Fails with a readable message when the chapter page redirected somewhere else.
+     *
+     * Japscan keeps dead chapters in its listings: their URL answers a redirect to the manga page,
+     * whose reader then yields zero pages. Checking the final URL turns that into an explicit error
+     * instead of an empty chapter.
+     */
+    private fun checkChapterRedirect(requested: HttpUrl, finalUrl: HttpUrl) {
+        val requestedSegments = requested.pathSegments.filter(String::isNotEmpty)
+        val finalSegments = finalUrl.pathSegments.filter(String::isNotEmpty)
+        Log.d(
+            "JapscanReader",
+            "redirect check: requested=/${requestedSegments.joinToString("/")} " +
+                "final=/${finalSegments.joinToString("/")}",
+        )
+
+        // Cosmetic normalisation (missing or extra trailing slash, same path): nothing to report.
+        if (requestedSegments == finalSegments) return
+
+        // A dead chapter drops its last segment and lands on the manga page (or the catalogue).
+        // Only that shape is fatal: any other redirect (http→https, other host, query rewrite) is
+        // the site normalising the URL and must not block reading.
+        val chapterDropped = finalSegments.isNotEmpty() &&
+            finalSegments.size < requestedSegments.size &&
+            requestedSegments.take(finalSegments.size) == finalSegments
+        if (chapterDropped) {
+            throw Exception("Ce chapitre n'existe plus sur Japscan : il redirige vers $finalUrl")
+        }
+        Log.d("JapscanReader", "redirect ignored (URL normalisation): $finalUrl")
     }
 
     private suspend fun captchaPresent(chapterUrl: String): Boolean = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK).use {
         CAPTCHA_REGEX.containsMatchIn(it.body.string())
     }
 
-    private suspend fun solveCaptcha(chapterUrl: String, isReader: Boolean) {
-        if (!captchaPresent(chapterUrl)) return
+    private suspend fun solveCaptcha(chapterUrl: String, captchaUp: Boolean, isReader: Boolean) {
+        if (!captchaUp) return
 
         // Cold sessions usually get past the captcha after loading the homepage once in a WebView
         warmupWebViewSession()
@@ -384,7 +502,7 @@ abstract class Japscan :
                         client.newCall(captchaRequest).execute().use { resp ->
                             val body = resp.body.string()
                             Log.d("JapscanDebug", "Captcha response: $body")
-                            body.contains(""""success":\s*true""".toRegex())
+                            body.contains(CAPTCHA_SUCCESS_REGEX)
                         }
                     }.getOrDefault(false)
 
@@ -412,7 +530,7 @@ abstract class Japscan :
     }
 
     private suspend fun warmupWebViewSession() {
-        runCatching {
+        runCatchingCancellable {
             runWebView<Unit>(timeout = 8.seconds) {
                 var finished = false
                 onPageFinished { finished = true }
@@ -421,6 +539,83 @@ abstract class Japscan :
                 loadUrl("$baseUrl/")
             }
         }
+    }
+
+    /**
+     * Loads [chapterUrl] in a WebView with the hooks of one reader mode and collects the pages.
+     *
+     * @param[chapterUrl] Chapter URL to load.
+     * @param[urlSegment] First path segment (`manga`, `manhwa`, `manhua`, `bd`...), used by the JS.
+     * @param[isWebtoon] `true` to install the long-strip hooks, `false` for the paginated ones.
+     * @return Saved page paths, empty when the reader produced nothing.
+     */
+    private suspend fun capturePages(chapterUrl: String, urlSegment: String, isWebtoon: Boolean): Pair<List<String>, Boolean> {
+        val interfaceName = randomString()
+        // Pages travel over a loopback socket when it can be started; the bridge stays the
+        // fallback for every page the socket does not take.
+        val receiver = runCatching { PageReceiver(applicationContext.cacheDir) }
+            .onFailure { Log.w("JapscanReader", "page receiver unavailable: ${it.message}") }
+            .getOrNull()
+        val jsInterface = JsInterface(applicationContext.cacheDir, receiver)
+        // Without this the socket capture looks idle to the watchdog and gets cut short.
+        receiver?.onPage = { jsInterface.activity.trySend(Unit) }
+        val userAgent = headers["User-Agent"]
+        Log.d("JapscanReader", "capturePages: webtoon=$isWebtoon url=$chapterUrl")
+
+        val webView = withContext(Dispatchers.Main) {
+            createReaderWebView(
+                chapterUrl = chapterUrl,
+                isWebtoon = isWebtoon,
+                urlSegment = urlSegment,
+                interfaceName = interfaceName,
+                jsInterface = jsInterface,
+                userAgent = userAgent,
+                uploadUrl = receiver?.baseUrl.orEmpty(),
+            )
+        }
+        try {
+            // Progress-based budget: a 160-page chapter legitimately takes minutes, so the run is
+            // only stopped after IDLE_TIMEOUT without a new page. A generous hard cap still guards
+            // against a reader that keeps emitting forever.
+            val hardDeadline = TimeSource.Monotonic.markNow() + 20.minutes
+            while (!jsInterface.done.isCompleted && hardDeadline.hasNotPassedNow()) {
+                withTimeoutOrNull(IDLE_TIMEOUT) { jsInterface.activity.receive() } ?: break
+            }
+        } finally {
+            // Japscan sets window.__poisoned when it spots a patched built-in. Log it before the
+            // WebView goes away: a poisoned page explains a silent zero-page capture.
+            //
+            // Every WebView method must run on the thread that created it. Missing the Main
+            // switch here threw a RuntimeException out of this `finally`, which discarded a
+            // perfectly captured chapter and failed the whole getPageList.
+            val probe = withTimeoutOrNull(2.seconds) {
+                runCatchingCancellable {
+                    withContext(Dispatchers.Main) {
+                        suspendCancellableCoroutine<String?> { continuation ->
+                            webView.evaluateJavascript(
+                                "JSON.stringify({poisoned:!!window.__poisoned," +
+                                    "imgs:document.images.length," +
+                                    "data:Array.prototype.filter.call(document.images,function(i){" +
+                                    "return (i.currentSrc||i.src||'').indexOf('data:image/')===0;}).length," +
+                                    "blob:Array.prototype.filter.call(document.images,function(i){" +
+                                    "return (i.currentSrc||i.src||'').indexOf('blob:')===0;}).length})",
+                            ) { value -> continuation.resume(value) }
+                        }
+                    }
+                }.onFailure { Log.w("JapscanReader", "page probe failed: ${it.message}") }.getOrNull()
+            }
+            Log.w("JapscanReader", "page probe: $probe (webtoon=$isWebtoon)")
+            withContext(NonCancellable + Dispatchers.Main) { runCatching { webView.destroy() } }
+            receiver?.close()
+        }
+
+        val captured = receiver?.snapshot().orEmpty() + jsInterface.snapshot()
+        val completed = jsInterface.done.isCompleted
+        Log.d(
+            "JapscanReader",
+            "capturePages end: captured=${captured.size} done=$completed webtoon=$isWebtoon",
+        )
+        return captured to completed
     }
 
     // A manual WebView instead of runWebView: the long-strip reader needs a forced desktop-sized
@@ -433,6 +628,7 @@ abstract class Japscan :
         interfaceName: String,
         jsInterface: JsInterface,
         userAgent: String?,
+        uploadUrl: String,
     ): WebView = WebView(applicationContext).apply {
         settings.domStorageEnabled = true
         settings.javaScriptEnabled = true
@@ -452,14 +648,36 @@ abstract class Japscan :
         }
         addJavascriptInterface(jsInterface, interfaceName)
 
+        // The renderer's own explanation of a failed request (CSP, mixed content, ...) is the only
+        // way to tell those apart from a socket that is simply not listening.
+        webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+                val text = message.message()
+                if (text.contains("Mixed Content", true) || text.contains("Refused to", true) ||
+                    text.contains("127.0.0.1", true) || text.contains("localhost", true)
+                ) {
+                    Log.w("JapscanReader", "console: $text (${message.sourceId()}:${message.lineNumber()})")
+                }
+                return true
+            }
+        }
+
         webViewClient = object : WebViewClient() {
             // The reader pulls rotating ad hosts whose modals break the detached descrambler,
-            // so only the origins the reader needs are allowed.
+            // so only the origins the reader needs are allowed. Every blocked host is logged once:
+            // an over-eager allowlist is invisible otherwise, and it looks exactly like a chapter
+            // whose reader never mounts.
+            val blockedHosts = mutableSetOf<String>()
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest): WebResourceResponse? {
                 val host = request.url.host ?: return null
+                // The page receiver lives on loopback; blocking it would break our own uploads.
+                if (host == LOOPBACK_HOST) return null
                 return if (ALLOWED_HOSTS.any { host == it || host.endsWith(".$it") }) {
                     null
                 } else {
+                    if (blockedHosts.add(host)) {
+                        Log.d("JapscanReader", "blocked host: $host${request.url.path}")
+                    }
                     // A null body keeps some WebView builds pending, stalling the capture
                     WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
                 }
@@ -468,7 +686,7 @@ abstract class Japscan :
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
                 view?.evaluateJavascript(ACLIB_STUB, null)
-                view?.evaluateJavascript(if (isWebtoon) webtoonHooks(interfaceName) else PAGINATED_HOOK, null)
+                view?.evaluateJavascript(if (isWebtoon) webtoonHooks(interfaceName) else paginatedHook(interfaceName), null)
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
@@ -476,7 +694,11 @@ abstract class Japscan :
                 // Keep the detached WebView's JS timers running
                 view?.onResume()
                 view?.resumeTimers()
-                val driver = if (isWebtoon) webtoonDriver(interfaceName, urlSegment) else paginatedDriver(interfaceName)
+                val driver = if (isWebtoon) {
+                    webtoonDriver(interfaceName, urlSegment)
+                } else {
+                    paginatedDriver(interfaceName, uploadUrl)
+                }
                 view?.evaluateJavascript(driver, null)
             }
         }
@@ -486,19 +708,216 @@ abstract class Japscan :
 
     // Spooled pages must outlive the chapter being read (the reader may re-request them or
     // preload the next chapter), so only files older than a day are reaped.
+
+    /** Short-lived page list of a chapter, so a read followed by a download captures it once. */
+    private data class CachedChapterPages(val paths: List<String>, val savedAt: Long)
+
+    private val pageListCache = object : LinkedHashMap<String, CachedChapterPages>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedChapterPages>): Boolean = size > PAGE_LIST_CACHE_SIZE
+    }
+
+    /** Returns the cached page files for [chapterUrl], dropping the entry when stale or gone. */
+    private fun cachedPageList(chapterUrl: String): List<String>? = synchronized(pageListCache) {
+        val entry = pageListCache[chapterUrl] ?: return null
+        val expired = System.currentTimeMillis() - entry.savedAt > PAGE_LIST_CACHE_TTL_MS
+        val missing = entry.paths.any { !File(it).exists() }
+        if (expired || missing) {
+            pageListCache.remove(chapterUrl)
+            return null
+        }
+        entry.paths
+    }
+
+    /** Stores [paths] for [chapterUrl], evicting the least recently used chapter. */
+    private fun rememberPageList(chapterUrl: String, paths: List<String>) = synchronized(pageListCache) {
+        pageListCache[chapterUrl] = CachedChapterPages(paths, System.currentTimeMillis())
+        Log.d("JapscanReader", "page list cached for $chapterUrl (${paths.size} pages)")
+    }
+
+    // The sweep only reclaims day-old spool files, so running it on every chapter open is pure
+    // directory churn.
+    @Volatile
+    private var lastSweepAt = 0L
+
     private fun sweepPageCache(cacheDir: File) {
-        val cutoff = System.currentTimeMillis() - 24.hours.inWholeMilliseconds
+        val now = System.currentTimeMillis()
+        if (now - lastSweepAt < PAGE_CACHE_SWEEP_INTERVAL_MS) return
+        lastSweepAt = now
+        val cutoff = now - 24.hours.inWholeMilliseconds
         cacheDir.listFiles()?.forEach {
             if (it.name.startsWith(CACHE_FILE_PREFIX) && it.lastModified() < cutoff) it.delete()
         }
     }
 
-    private fun randomString(length: Int = 10): String {
-        val charPool = ('a'..'z') + ('A'..'Z')
-        return List(length) { charPool.random() }.joinToString("")
+    /**
+     * Receives pages over a loopback socket instead of the JS bridge.
+     *
+     * The bridge only transports `String`, so a page has to be base64 encoded on the JS side and
+     * copied into a Java string: ~21 ms and ~750 KB of allocations per page, of which only 3 ms is
+     * actual decoding and writing. Posting the Blob straight to a local socket ships the same bytes
+     * in one copy.
+     *
+     * The port is ephemeral and the URL carries the page index, so page order does not depend on
+     * call order. Every failure is non-fatal: the driver falls back to the bridge.
+     */
+    private class PageReceiver(private val cacheDir: File) : Closeable {
+        private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}"
+        private val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+        private val received = mutableListOf<File>()
+
+        @Volatile
+        private var running = true
+
+        /** Called after every received page: the socket path must still feed the idle watchdog. */
+        @Volatile
+        var onPage: (() -> Unit)? = null
+
+        val baseUrl: String = "http://127.0.0.1:${server.localPort}"
+
+        private val worker = Thread(
+            {
+                while (running) {
+                    try {
+                        server.accept().use { readPage(it) }
+                    } catch (e: Exception) {
+                        if (running) Log.w("JapscanReader", "receiver: ${e.message}")
+                    }
+                }
+            },
+            "japscan-pages",
+        ).apply {
+            isDaemon = true
+            start()
+        }
+
+        private fun readPage(socket: Socket) {
+            socket.soTimeout = SOCKET_TIMEOUT_MS
+            val input = socket.getInputStream().buffered()
+            val requestLine = readLine(input) ?: return
+            var contentLength = -1
+            while (true) {
+                val header = readLine(input) ?: break
+                if (header.isEmpty()) break
+                if (header.startsWith("Content-Length:", ignoreCase = true)) {
+                    contentLength = header.substringAfter(':').trim().toIntOrNull() ?: -1
+                }
+            }
+            // A Blob body is not a "simple" request, so the browser sends a CORS preflight
+            // first; answering it here is what lets the upload through.
+            if (requestLine.substringBefore(' ').equals("OPTIONS", ignoreCase = true)) {
+                reply(socket, 204)
+                return
+            }
+            val index = requestLine.split(' ').getOrNull(1)?.substringAfterLast('/')?.toIntOrNull()
+            if (index == null || contentLength <= 0) {
+                reply(socket, 400)
+                return
+            }
+            val file = File(cacheDir, "$sessionTag-$index.bin")
+            FileOutputStream(file).use { out -> copyExactly(input, out, contentLength) }
+            synchronized(received) { received.add(file) }
+            onPage?.invoke()
+            reply(socket, 204)
+        }
+
+        private fun copyExactly(input: InputStream, out: OutputStream, length: Int) {
+            val buffer = COPY_BUFFER
+
+            var remaining = length
+            while (remaining > 0) {
+                val read = input.read(buffer, 0, minOf(buffer.size, remaining))
+                if (read < 0) return
+                out.write(buffer, 0, read)
+                remaining -= read
+            }
+        }
+
+        private fun readLine(input: InputStream): String? {
+            val line = ByteArrayOutputStream(256)
+            while (true) {
+                val byte = input.read()
+                if (byte < 0) return if (line.size() == 0) null else line.toString("ISO-8859-1")
+                if (byte == '\n'.code) return line.toString("ISO-8859-1").removeSuffix("\r")
+                line.write(byte)
+                if (line.size() > MAX_HEADER_LINE) return null
+            }
+        }
+
+        private fun reply(socket: Socket, code: Int) {
+            runCatching {
+                val reason = if (code == 204) "No Content" else "Bad Request"
+                socket.getOutputStream().apply {
+                    write(
+                        (
+                            "HTTP/1.1 $code $reason\r\n" +
+                                "Access-Control-Allow-Origin: *\r\n" +
+                                "Access-Control-Allow-Methods: POST, OPTIONS\r\n" +
+                                "Access-Control-Allow-Headers: *\r\n" +
+                                // Without this the browser re-asks before every page, turning each
+                                // upload into two round trips.
+                                "Access-Control-Max-Age: 86400\r\n" +
+                                "Content-Length: 0\r\n" +
+                                "Connection: close\r\n\r\n"
+                            ).toByteArray(),
+                    )
+                    flush()
+                }
+            }
+        }
+
+        /** Drops every page received so far, so a retry starts from a clean slate. */
+        fun clear() {
+            synchronized(received) {
+                received.forEach { runCatching { it.delete() } }
+                received.clear()
+            }
+        }
+
+        /** Received files in page order, with an exact repeat of the previous page dropped. */
+        fun snapshot(): List<String> {
+            val ordered = synchronized(received) {
+                received.sortedBy { it.name.substringAfterLast('-').substringBefore('.').toIntOrNull() ?: 0 }
+            }
+            val paths = ArrayList<String>(ordered.size)
+            var previous: File? = null
+            for (file in ordered) {
+                val prev = previous
+                if (prev != null && file.length() == prev.length() &&
+                    file.readBytes().contentEquals(prev.readBytes())
+                ) {
+                    Log.d("JapscanReader", "receiver: dropped ${file.name}, duplicate of ${prev.name}")
+                    file.delete()
+                    continue
+                }
+                previous = file
+                paths.add(file.absolutePath)
+            }
+            return paths
+        }
+
+        override fun close() {
+            running = false
+            runCatching { server.close() }
+        }
+
+        private companion object {
+            private const val SOCKET_TIMEOUT_MS = 10_000
+
+            // Reused across pages: a fresh 64 KB array per page is 12 MB of garbage per chapter.
+            // The accept loop handles one connection at a time, so a shared buffer is safe.
+            private val COPY_BUFFER = ByteArray(64 * 1024)
+            private const val MAX_HEADER_LINE = 8 * 1024
+        }
     }
 
-    private class JsInterface(private val cacheDir: File) {
+    private fun randomString(length: Int = 10): String = buildString(length) {
+        repeat(length) { append(INTERFACE_NAME_CHARS.random()) }
+    }
+
+    private class JsInterface(
+        private val cacheDir: File,
+        private val receiver: PageReceiver?,
+    ) {
         val done = CompletableDeferred<Unit>()
         val activity = Channel<Unit>(Channel.CONFLATED)
 
@@ -509,23 +928,54 @@ abstract class Japscan :
 
         @JavascriptInterface
         @Suppress("UNUSED")
-        fun savePage(dataUri: String) {
+        fun savePage(payload: String) {
             activity.trySend(Unit)
-            val commaIdx = dataUri.indexOf(',')
-            if (commaIdx <= 0) return
+            // The JS side strips the `data:image/…;base64,` header, so the payload is decoded as
+            // it arrives: no ~700 KB copy per page on the Java heap. A data URI is still accepted.
+            val base64 = if (payload.startsWith("data:")) payload.substring(payload.indexOf(',') + 1) else payload
+            if (base64.isEmpty()) {
+                Log.d("JapscanReader", "savePage: empty payload")
+                return
+            }
             runCatching {
-                val bytes = Base64.decode(dataUri.substring(commaIdx + 1), Base64.DEFAULT)
+                val startedAt = System.nanoTime()
+                val bytes = Base64.decode(base64, Base64.DEFAULT)
+                val decodedAt = System.nanoTime()
                 synchronized(savedPaths) {
                     val file = File(cacheDir, "$sessionTag-${savedPaths.size}.bin")
                     file.writeBytes(bytes)
+                    val writtenAt = System.nanoTime()
                     savedPaths.add(file.absolutePath)
+                    // One line per 25 pages: the driver logs the aggregate at the end.
+                    if (savedPaths.size % 25 == 0) {
+                        Log.d(
+                            "JapscanReader",
+                            "savePage: page ${savedPaths.size} (${bytes.size} bytes, " +
+                                "decode=${(decodedAt - startedAt) / 1_000_000}ms " +
+                                "write=${(writtenAt - decodedAt) / 1_000_000}ms " +
+                                "chars=${payload.length})",
+                        )
+                    }
                 }
-            }
+            }.onFailure { Log.w("JapscanReader", "savePage failed: ${it.message}") }
         }
 
         @JavascriptInterface
         @Suppress("UNUSED")
-        fun log(message: String) {}
+        fun resetPages() {
+            synchronized(savedPaths) {
+                savedPaths.forEach { runCatching { File(it).delete() } }
+                savedPaths.clear()
+            }
+            receiver?.clear()
+            Log.d("JapscanReader", "resetPages: cache cleared")
+        }
+
+        @JavascriptInterface
+        @Suppress("UNUSED")
+        fun log(message: String) {
+            Log.d("JapscanReader", message)
+        }
 
         @JavascriptInterface
         @Suppress("UNUSED")
@@ -544,13 +994,6 @@ abstract class Japscan :
             summary = "%s"
             setDefaultValue("hide")
         }.let(screen::addPreference)
-
-        TwoCaptcha.addPreferenceToScreen(
-            screen = screen,
-            currentKey = twoCaptchaApiKey(),
-            title = TWOCAPTCHA_API_KEY_TITLE,
-            key = TWOCAPTCHA_API_KEY,
-        )
     }
 
     companion object {
@@ -587,20 +1030,33 @@ abstract class Japscan :
         private val CHAPTER_NUM_REGEX = Regex("""(?i)chapitre\s+([\d.]+)""")
         private val NON_NUMBER_REGEX = Regex("[^0-9.]+")
         private val CAPTCHA_REGEX = """window\.__captcha\s*=\s*\{\s*needed\s*:\s*true\s*,?""".toRegex()
+        private val CAPTCHA_SUCCESS_REGEX = Regex(""""success":\s*true""")
         private val DATE_FORMAT = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.US)
         private val PARIS = ZoneId.of("Europe/Paris")
 
         private const val SHOW_SPOILER_CHAPTERS_TITLE = "Les chapitres en Anglais ou non traduit sont upload en tant que \" Spoilers \" sur Japscan"
         private const val SHOW_SPOILER_CHAPTERS = "JAPSCAN_SPOILER_CHAPTERS"
-        private const val TWOCAPTCHA_API_KEY = "japscan_2captcha_api_key"
-        private const val TWOCAPTCHA_API_KEY_TITLE = "Clé API 2Captcha (Résolution automatique Cloudflare Turnstile)"
         private val STRIPS_ARRAY_REGEX = """(?:strips|"[a-f0-9]{6}")\s*:\s*(\[[^\]]*\])""".toRegex()
         private val ELEMENT_REGEX = """\{\s*"uuid"\s*:\s*"([^"]+)"\s*,\s*"src"\s*:\s*"([^"]*)"\s*\}""".toRegex()
         private val TOKEN_REGEX = """(?:token|"[a-f0-9]{6}")\s*:\s*"([0-9a-fA-F]{64})"""".toRegex()
 
+        // A const string instead of ('a'..'z') + ('A'..'Z'): a CharRange is an Iterable, not a
+        // Collection, so the plus fell back to the iterating overload.
+        private const val INTERFACE_NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
         private const val CACHE_HOST = "japscan-cache.local"
+        private const val LOOPBACK_HOST = "127.0.0.1"
         private const val CACHE_FILE_PREFIX = "japscan-"
-        private val IDLE_TIMEOUT = 45.seconds
+
+        /** How long a captured page list is reused (read then download). */
+        private const val PAGE_LIST_CACHE_TTL_MS = 15 * 60 * 1000L
+
+        /** Maximum number of chapters kept in the page list cache. */
+        private const val PAGE_LIST_CACHE_SIZE = 30
+
+        /** Minimum delay between two sweeps of the spool directory. */
+        private const val PAGE_CACHE_SWEEP_INTERVAL_MS = 60 * 60 * 1000L
+        private val IDLE_TIMEOUT = 10.seconds
         private val CAPTCHA_POLL_INTERVAL = 5.seconds
         private const val CAPTCHA_MAX_POLLS = 15
 
