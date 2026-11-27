@@ -10,6 +10,7 @@ import android.util.Base64
 import android.util.Log
 import android.view.View
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -382,7 +383,7 @@ abstract class Japscan :
         // unexpected — captcha, degraded page, unknown reader build — falls back to the capture
         // below, which is still the only path that can learn a new alphabet.
         val mode = captureMode()
-        if (mode != CAPTURE_MODE_WEBVIEW) {
+        if (mode != CAPTURE_MODE_WEBVIEW && !cdnClosed()) {
             val fast = runCatchingCancellable { fastCapture(chapterUrl) }.getOrNull()
             if (fast != null) {
                 // A page the CDN refuses is not worth a WebView round trip, but it must not be
@@ -485,6 +486,16 @@ abstract class Japscan :
         return captured.mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
     }
 
+    /**
+     * Reports whether the CDN recently refused this client.
+     *
+     * Cloudflare answers an HTTP client it does not like with a 403 for every image, and even the
+     * chapter page request becomes slow while that lasts. One refusal parks the HTTP capture for
+     * [CDN_CLOSED_MS], so the chapters in between cost nothing, and the path is retried on its own
+     * once the window expires — the CDN reopens it when it feels like it.
+     */
+    private fun cdnClosed(): Boolean = System.currentTimeMillis() < preferences.getLong(CDN_CLOSED_UNTIL, 0L)
+
     /** Which capture the reader should try first; see the source preferences. */
     private fun captureMode(): String = preferences.getString(CAPTURE_MODE, CAPTURE_MODE_AUTO) ?: CAPTURE_MODE_AUTO
 
@@ -543,6 +554,10 @@ abstract class Japscan :
                 "download=${spool.elapsedMs}ms (${spool.paths.size} ok) total=${System.currentTimeMillis() - started}ms",
         )
         // One missing page out of a hundred is the CDN, not us: the reader path would drop it too.
+        if (spool.refused) {
+            preferences.edit().putLong(CDN_CLOSED_UNTIL, System.currentTimeMillis() + CDN_CLOSED_MS).apply()
+            return null
+        }
         val missing = paths.size - spool.paths.size
         if (missing > 0) {
             // Keep the decrypted document around: the dead entry is either a placeholder this
@@ -599,8 +614,14 @@ abstract class Japscan :
         warmupWebViewSession()
         openCaptchaWebView(chapterUrl)
         delay(CAPTCHA_WEBVIEW_WAIT)
+        // The clearance the user earned has to reach the cookie store the HTTP client and the
+        // capture WebView read from, or the next attempt starts on the challenge again.
+        runCatching { CookieManager.getInstance().flush() }
         // Leaving the WebView on screen once the challenge is cleared is just in the way.
         closeVisibleWebView(isReader)
+        // Cloudflare commits its cookie just after the page settles; retrying instantly is what
+        // made a freshly cleared challenge look like an empty chapter.
+        delay(2.seconds)
     }
 
     private fun closeVisibleWebView(isReader: Boolean) {
@@ -952,7 +973,11 @@ abstract class Japscan :
         // A random suffix: two downloads started in the same millisecond would otherwise write
         // the same files and overwrite each other's pages.
         private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}-${UUID.randomUUID()}"
-        private val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+
+        // The reader fires its uploads back to back, several of them before the previous reply
+        // lands: a small backlog drops connections and the pages are lost, so accept generously
+        // and serve each connection on its own thread.
+        private val server = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
         private val received = mutableListOf<File>()
 
         @Volatile
@@ -964,11 +989,16 @@ abstract class Japscan :
 
         val baseUrl: String = "http://127.0.0.1:${server.localPort}"
 
+        private val pool = java.util.concurrent.Executors.newFixedThreadPool(4) { runnable ->
+            Thread(runnable, "japscan-page").apply { isDaemon = true }
+        }
+
         private val worker = Thread(
             {
                 while (running) {
                     try {
-                        server.accept().use { readPage(it) }
+                        val socket = server.accept()
+                        pool.execute { socket.use { readPage(it) } }
                     } catch (e: Exception) {
                         if (running) Log.w("JapscanReader", "receiver: ${e.message}")
                     }
@@ -1010,12 +1040,12 @@ abstract class Japscan :
             reply(socket, 204)
         }
 
-        // Per receiver: two chapters captured in parallel are two receivers on two threads, and a
+        // One buffer per connection thread: the receiver serves several sockets at once, and a
         // shared buffer would interleave their bytes into each other's pages.
-        private val copyBuffer = ByteArray(64 * 1024)
+        private val copyBuffer = ThreadLocal.withInitial { ByteArray(64 * 1024) }
 
         private fun copyExactly(input: InputStream, out: OutputStream, length: Int) {
-            val buffer = copyBuffer
+            val buffer = copyBuffer.get()
 
             var remaining = length
             while (remaining > 0) {
@@ -1092,6 +1122,7 @@ abstract class Japscan :
         override fun close() {
             running = false
             runCatching { server.close() }
+            pool.shutdownNow()
         }
 
         private companion object {
@@ -1317,6 +1348,10 @@ abstract class Japscan :
 
         /** Pages the CDN may refuse before the WebView takes over again. */
         private const val MAX_MISSING_PAGES = 1
+
+        /** How long the HTTP capture stays parked after a CDN refusal. */
+        private const val CDN_CLOSED_UNTIL = "cdn_closed_until"
+        private const val CDN_CLOSED_MS = 10 * 60 * 1000L
 
         /** SharedPreferences key prefix of the substitution alphabet of a reader build. */
         private const val TABLE_PREFIX = "alphabet_"

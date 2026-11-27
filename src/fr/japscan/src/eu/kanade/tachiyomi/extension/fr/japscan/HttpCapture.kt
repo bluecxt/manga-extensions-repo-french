@@ -46,7 +46,13 @@ internal class HttpCapture(
      * @property requested Pages the chapter announced.
      * @property elapsedMs Wall time of the whole download.
      */
-    data class Spool(val paths: List<String>, val requested: Int, val elapsedMs: Long) {
+    data class Spool(
+        val paths: List<String>,
+        val requested: Int,
+        val elapsedMs: Long,
+        /** The CDN refused the probe: this client has no business asking again right now. */
+        val refused: Boolean = false,
+    ) {
         val complete: Boolean get() = paths.size == requested
     }
 
@@ -99,7 +105,12 @@ internal class HttpCapture(
         val probeFile = File(cacheDir, "$tag-0.bin")
         if (download(url(paths[0], cacheBuster), probeFile) != 200) {
             Log.d("JapscanReader", "http: CDN refused the probe, the chapter goes to the WebView")
-            return@withContext Spool(emptyList(), paths.size, System.currentTimeMillis() - started)
+            return@withContext Spool(
+                emptyList(),
+                paths.size,
+                System.currentTimeMillis() - started,
+                refused = true,
+            )
         }
 
         val gate = Semaphore(concurrency)

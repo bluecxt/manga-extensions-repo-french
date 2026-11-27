@@ -622,6 +622,11 @@ internal fun paginatedDriver(interfaceName: String, uploadUrl: String) = $$"""
                                             (pumped ? Math.round(sumUpload / pumped) : 0) + 'ms read_avg=' +
                                             (pumped ? Math.round(sumRead / pumped) : 0) + 'ms bridge_avg=' +
                                             (pumped ? Math.round(sumBridge / pumped) : 0) + 'ms');
+                                        // The last blob's upload can still be in flight: let the
+                                        // chain settle before telling Kotlin the capture is over,
+                                        // or that page lands after the snapshot and is lost.
+                                        await sleep(250);
+                                        await chain;
                                         try { window.$$interfaceName.passDone(); } catch(e) {}
                                         return;
                                     }
