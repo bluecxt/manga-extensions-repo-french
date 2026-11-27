@@ -85,7 +85,7 @@ import kotlin.time.TimeSource
  * keeps running against a WebView that is being destroyed, and the caller never learns that its
  * job was cancelled.
  */
-private inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
+internal inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
     Result.success(block())
 } catch (e: CancellationException) {
     throw e
@@ -122,6 +122,22 @@ abstract class Japscan :
 
     private val readerJsInterface by lazy { JsInterface(applicationContext.cacheDir) }
 
+    /**
+     * HTTP capture: reads the page list from the served markup instead of rendering the reader.
+     * It needs the substitution alphabet of the page's `reader.js` build, learned once per build.
+     */
+    private val httpCapture by lazy {
+        HttpCapture(
+            client = client,
+            headers = headers,
+            baseUrl = baseUrl,
+            cacheDir = applicationContext.cacheDir,
+            cdnUrl = CDN_URL,
+            concurrency = FAST_CONCURRENCY,
+            debugDir = applicationContext.getExternalFilesDir(null),
+        )
+    }
+
     private val idleHandler by lazy { Handler(Looper.getMainLooper()) }
 
     /** Everything one capture needs; the reused WebView reads it from [captureRequest]. */
@@ -151,6 +167,13 @@ abstract class Japscan :
                 .body((bytes ?: ByteArray(0)).toResponseBody("image/jpeg".toMediaType()))
                 .build()
         }
+        // The WebView holds the session the site's captcha gate is attached to; HTTP requests have
+        // to carry the same cookies or every chapter answers with a fresh captcha. One interceptor
+        // in both directions, ahead of everything else.
+        addInterceptor { chain -> CookieSync.intercept(chain) }
+        // The chapter images sit on their own host and are fetched in parallel, so they get their
+        // own rule: rules match in order, and the courtesy delay below stays on everything else.
+        rateLimit(permits = FAST_CONCURRENCY * 2, period = 1.seconds) { it.host == CDN_HOST }
         rateLimit(1, 2.seconds)
     }
 
@@ -354,6 +377,25 @@ abstract class Japscan :
             return paths.mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
         }
 
+        // Fast path: the page list is published in the markup the site serves, so a chapter costs
+        // one request plus its images instead of a navigation and a full render. Anything
+        // unexpected — captcha, degraded page, unknown reader build — falls back to the capture
+        // below, which is still the only path that can learn a new alphabet.
+        val mode = captureMode()
+        if (mode != CAPTURE_MODE_WEBVIEW) {
+            val fast = runCatchingCancellable { fastCapture(chapterUrl) }.getOrNull()
+            if (fast != null) {
+                // A page the CDN refuses is not worth a WebView round trip, but it must not be
+                // cached as a full chapter either.
+                if (fast.complete) rememberPageList(chapterUrl, fast.paths)
+                return fast.paths.mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
+            }
+            if (mode == CAPTURE_MODE_HTTP) {
+                throw Exception("Capture HTTP impossible pour ce chapitre (voir le journal JapscanReader)")
+            }
+            Log.d("JapscanReader", "http capture declined, falling back to the WebView: $chapterUrl")
+        }
+
         // manhwa/manhua usually use the long-strip reader, everything else the paginated one, but
         // the URL segment is only a hint: some manhua chapters mount the paginated reader. The mode
         // decides which hooks are installed before the page loads, so a mismatch is retried once
@@ -441,6 +483,95 @@ abstract class Japscan :
             }
         }
         return captured.mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
+    }
+
+    /** Which capture the reader should try first; see the source preferences. */
+    private fun captureMode(): String = preferences.getString(CAPTURE_MODE, CAPTURE_MODE_AUTO) ?: CAPTURE_MODE_AUTO
+
+    /**
+     * Reads a chapter over HTTP: markup, decryption, parallel download.
+     *
+     * @return Absolute paths of the spooled pages, or `null` when this chapter has to go through
+     * the WebView (captcha the solver could not answer, no page config, unknown reader build).
+     */
+    // Pages read over HTTP, and whether the chapter is complete enough to be cached.
+    private class FastPages(val paths: List<String>, val complete: Boolean)
+
+    private suspend fun fastCapture(chapterUrl: String): FastPages? {
+        val started = System.currentTimeMillis()
+        val html = httpCapture.chapterHtml(chapterUrl) { solveChallengeFromHtml(it, chapterUrl) }
+        if (html == null) {
+            Log.d("JapscanReader", "http: no markup for $chapterUrl")
+            return null
+        }
+        val htmlMs = System.currentTimeMillis() - started
+
+        val page = JapscanCrypto.config(html) ?: run {
+            Log.d("JapscanReader", "http: no page config in ${html.length} chars of markup")
+            return null
+        }
+        val script = JapscanCrypto.readerScript(html) ?: run {
+            Log.d("JapscanReader", "http: no reader script in the markup")
+            return null
+        }
+        val build = TABLE_KEY_REGEX.find(script)?.value ?: return null
+
+        var learnedMs = 0L
+        var table = preferences.getString(TABLE_PREFIX + build, null)
+        if (table == null) {
+            val learnStarted = System.currentTimeMillis()
+            table = learnTable(chapterUrl, build)
+            learnedMs = System.currentTimeMillis() - learnStarted
+            if (table == null) {
+                Log.w("JapscanReader", "http: could not learn the alphabet of $build")
+                return null
+            }
+        }
+
+        val paths = JapscanCrypto.decrypt(page, table)
+        if (paths == null) {
+            // The alphabet belongs to the reader build: a failure means the site shipped a new one.
+            preferences.edit().remove(TABLE_PREFIX + build).apply()
+            Log.w("JapscanReader", "http: decryption failed for build $build, alphabet dropped")
+            return null
+        }
+
+        val spool = httpCapture.spool(paths)
+        Log.d(
+            "JapscanReader",
+            "http: ${paths.size} pages, markup=${htmlMs}ms learn=${learnedMs}ms " +
+                "download=${spool.elapsedMs}ms (${spool.paths.size} ok) total=${System.currentTimeMillis() - started}ms",
+        )
+        // One missing page out of a hundred is the CDN, not us: the reader path would drop it too.
+        val missing = paths.size - spool.paths.size
+        if (missing > 0) {
+            // Keep the decrypted document around: the dead entry is either a placeholder this
+            // build signals with a marker we do not read yet, or a page the CDN really lost.
+            val dir = applicationContext.getExternalFilesDir(null)
+            runCatching {
+                val json = JapscanCrypto.rawJson(page, table)
+                if (dir != null && json != null) {
+                    File(dir, "japscan-payload-${System.currentTimeMillis()}.json").writeText(json)
+                }
+            }
+        }
+        return when {
+            missing == 0 -> FastPages(spool.paths, complete = true)
+            missing <= MAX_MISSING_PAGES -> FastPages(spool.paths, complete = false)
+            else -> null
+        }
+    }
+
+    /**
+     * Recovers the substitution alphabet of the reader build the page runs and remembers it.
+     *
+     * @return The 62-character alphabet, or `null` when the page never decrypted anything.
+     */
+    private suspend fun learnTable(chapterUrl: String, build: String): String? {
+        val table = TableLearning.learn(chapterUrl, headers.toMap()) ?: return null
+        preferences.edit().putString(TABLE_PREFIX + build, table).apply()
+        Log.d("JapscanReader", "http: learned alphabet for $build")
+        return table
     }
 
     private fun openCaptchaWebView(chapterUrl: String) {
@@ -1113,6 +1244,19 @@ abstract class Japscan :
             summary = "%s"
             setDefaultValue("hide")
         }.let(screen::addPreference)
+
+        ListPreference(screen.context).apply {
+            key = CAPTURE_MODE
+            title = "Méthode de capture des chapitres"
+            entries = arrayOf(
+                "Automatique (HTTP, puis WebView en secours)",
+                "HTTP uniquement (rapide, échoue si le site bloque)",
+                "WebView uniquement (ancienne méthode, lente)",
+            )
+            entryValues = arrayOf(CAPTURE_MODE_AUTO, CAPTURE_MODE_HTTP, CAPTURE_MODE_WEBVIEW)
+            summary = "%s"
+            setDefaultValue(CAPTURE_MODE_AUTO)
+        }.let(screen::addPreference)
     }
 
     companion object {
@@ -1163,6 +1307,26 @@ abstract class Japscan :
         private const val INTERFACE_NAME_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
         private const val CACHE_HOST = "japscan-cache.local"
+
+        /** Host serving the chapter illustrations; the only one exempt from the courtesy delay. */
+        private const val CDN_HOST = "c4.japscan.foo"
+        private const val CDN_URL = "https://$CDN_HOST"
+
+        /** Images in flight during an HTTP capture. */
+        private const val FAST_CONCURRENCY = 8
+
+        /** Pages the CDN may refuse before the WebView takes over again. */
+        private const val MAX_MISSING_PAGES = 1
+
+        /** SharedPreferences key prefix of the substitution alphabet of a reader build. */
+        private const val TABLE_PREFIX = "alphabet_"
+        private val TABLE_KEY_REGEX = Regex("[a-f0-9]{32}")
+
+        /** Capture strategy: HTTP first, HTTP only, or the WebView capture of older builds. */
+        private const val CAPTURE_MODE = "JAPSCAN_CAPTURE_MODE"
+        private const val CAPTURE_MODE_AUTO = "auto"
+        private const val CAPTURE_MODE_HTTP = "http"
+        private const val CAPTURE_MODE_WEBVIEW = "webview"
         private const val LOOPBACK_HOST = "127.0.0.1"
         private const val CACHE_FILE_PREFIX = "japscan-"
 
