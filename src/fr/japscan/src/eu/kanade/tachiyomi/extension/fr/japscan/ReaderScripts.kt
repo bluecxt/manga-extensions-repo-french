@@ -412,10 +412,14 @@ internal fun paginatedDriver(interfaceName: String, uploadUrl: String) = $$"""
                                             var pageHtml = await refetched.text();
                                             var pagesBlock = pageHtml.match(/id="pages"[^>]*>([\s\S]*?)<\/select>/);
                                             var pageOptions = pagesBlock ? (pagesBlock[1].match(/<option/g) || []).length : 0;
+                                            // The served page never carries #pages options: the reader fills
+                                            // that list itself. What the good page does carry is the
+                                            // encrypted page config, so that is what tells them apart.
+                                            var hasConfig = /var\s+\w+\s*=\s*\["eyJkIj/.test(pageHtml);
                                             window.__jlog('[japscan] re-fetch self: status=' + refetched.status +
                                                 ' len=' + pageHtml.length + ' pageOptions=' + pageOptions +
                                                 ' reader=' + (pageHtml.indexOf('single-reader') >= 0));
-                                            if (pageOptions > 0) {
+                                            if (hasConfig) {
                                                 document.open();
                                                 document.write(pageHtml);
                                                 document.close();

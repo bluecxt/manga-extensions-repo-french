@@ -477,6 +477,9 @@ abstract class Japscan :
             Log.w("JapscanReader", "getPageList finished with zero page: $chapterUrl (captcha=${readerJsInterface.captchaSeen})")
             // A captcha the solver could not answer looks nothing like an empty chapter, and saying
             // so is the difference between "retry" and "this chapter is gone".
+            redirectedTo?.let { finalUrl ->
+                throw Exception("Ce chapitre n'existe plus sur Japscan : il redirige vers $finalUrl")
+            }
             throw if (readerJsInterface.captchaSeen) {
                 Exception("Le captcha de Japscan n'a pas pu être résolu. Réessaie : la tentative suivante part souvent d'une nouvelle série d'images.")
             } else {
@@ -801,9 +804,10 @@ abstract class Japscan :
             receiver?.close()
         }
 
-        redirectedTo?.let { finalUrl ->
-            throw Exception("Ce chapitre n'existe plus sur Japscan : il redirige vers $finalUrl")
-        }
+        // A redirect is treated as an empty capture, not as a verdict: the site also redirects
+        // transiently (rate limiting, challenge), and one more attempt usually lands on the real
+        // page. getPageList only reports the chapter as gone once every attempt hit it.
+        redirectedTo?.let { finalUrl -> Log.w("JapscanReader", "capture redirected to $finalUrl, treating it as empty") }
         val captured = receiver?.snapshot().orEmpty() + jsInterface.snapshot()
         val completed = jsInterface.done.isCompleted
         Log.d(
