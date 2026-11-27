@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Bitmap
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import android.util.Log
 import android.view.View
@@ -43,7 +45,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import okhttp3.CacheControl
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -69,6 +70,7 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Collections
 import java.util.Locale
+import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
@@ -97,6 +99,39 @@ abstract class Japscan :
     ConfigurableSource {
 
     private val preferences by getPreferencesLazy()
+
+    // One WebView for the whole process. Destroying it after every chapter left Chromium in a state
+    // where the next view got a reader shell with no pages at all: only the first capture after a
+    // cold start ever succeeded. Reusing it also keeps the renderer warm between chapters.
+    @Volatile
+    private var readerWebView: WebView? = null
+
+    @Volatile
+    private var captureRequest: CaptureRequest? = null
+
+    /** Final URL when the chapter redirected elsewhere, which means it no longer exists. */
+    @Volatile
+    private var redirectedTo: String? = null
+
+    // Which same-origin requests the reader makes during the current capture: the page list has to
+    // come from one of them, so seeing them (or not) tells a dead script from a blocked endpoint.
+    private val seenRequests: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+
+    @Volatile
+    private var readerInterfaceName: String? = null
+
+    private val readerJsInterface by lazy { JsInterface(applicationContext.cacheDir) }
+
+    private val idleHandler by lazy { Handler(Looper.getMainLooper()) }
+
+    /** Everything one capture needs; the reused WebView reads it from [captureRequest]. */
+    private class CaptureRequest(
+        val chapterUrl: String,
+        val urlSegment: String,
+        val isWebtoon: Boolean,
+        val interfaceName: String,
+        val uploadUrl: String,
+    )
 
     // Pages are captured from the reader's canvases and spooled to the cache dir; their imageUrl
     // points at a sentinel host that this interceptor serves from disk, ahead of the rate limiter.
@@ -309,7 +344,7 @@ abstract class Japscan :
         val context = applicationContext
         val chapterUrl = baseUrl + chapter.url
         sweepPageCache(context.cacheDir)
-        Log.d("JapscanReader", "getPageList start: url=$chapterUrl isReader=$isReader")
+        Log.d("JapscanReader", "getPageList start: url=$chapterUrl")
 
         // cachedPageList only returns an entry whose files are still spooled and that is younger
         // than PAGE_LIST_CACHE_TTL_MS, and rememberPageList only stores a completed capture, so a
@@ -319,12 +354,6 @@ abstract class Japscan :
             return paths.mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
         }
 
-        val requested = chapterUrl.toHttpUrl()
-        val probe = probeChapter(chapterUrl)
-        checkChapterRedirect(requested, probe.finalUrl)
-        solveCaptcha(chapterUrl, probe.captchaUp, isReader)
-        Log.d("JapscanReader", "captcha step done for $chapterUrl")
-
         // manhwa/manhua usually use the long-strip reader, everything else the paginated one, but
         // the URL segment is only a hint: some manhua chapters mount the paginated reader. The mode
         // decides which hooks are installed before the page loads, so a mismatch is retried once
@@ -333,15 +362,51 @@ abstract class Japscan :
         var isWebtoon = urlSegment == "manhwa" || urlSegment == "manhua"
 
         var (captured, completed) = capturePages(chapterUrl, urlSegment, isWebtoon)
-        if (captured.isEmpty()) {
-            // A first attempt can come back empty when the reader mounted late (slow page,
-            // challenge still settling). Retry the SAME mode before assuming the mode is wrong:
-            // switching to the other hooks on a paginated DOM makes the driver give up by design.
-            Log.w("JapscanReader", "no page captured with webtoon=$isWebtoon, retrying the same mode")
-            delay(2.seconds)
-            val sameMode = capturePages(chapterUrl, urlSegment, isWebtoon)
-            captured = sameMode.first
-            completed = sameMode.second
+        // A captcha never clears itself, so it is handled before any retry budget is spent. Each
+        // round solves the page the WebView saw; a failed solve reloads the chapter, which serves a
+        // fresh set of strips, and a fresh captcha is what the heuristic is right about ~97% of the
+        // time. Repeating on new captchas is stronger than insisting on the same one.
+        var captchaRounds = 0
+        while (captured.isEmpty() && readerJsInterface.captchaSeen && captchaRounds < CAPTCHA_REFRESH_ATTEMPTS) {
+            captchaRounds++
+            val captchaHtml = readerJsInterface.captchaPageHtml
+            val solved = captchaHtml != null && solveChallengeFromHtml(captchaHtml, chapterUrl)
+            Log.w("JapscanReader", "captcha round $captchaRounds: solved=$solved")
+            val retry = capturePages(chapterUrl, urlSegment, isWebtoon)
+            captured = retry.first
+            completed = retry.second
+        }
+        if (captured.isEmpty() && readerJsInterface.cloudflareSeen) {
+            // A Cloudflare challenge cannot be answered by a detached WebView: hand it to the same
+            // visible window the app would use, then try again.
+            Log.w("JapscanReader", "Cloudflare challenge in the WebView, asking the user to clear it")
+            askUserForWebViewCaptcha(chapterUrl, isReader)
+            val afterChallenge = capturePages(chapterUrl, urlSegment, isWebtoon)
+            captured = afterChallenge.first
+            completed = afterChallenge.second
+        }
+        if (captured.isEmpty() && readerJsInterface.captchaSeen) {
+            // Only a visible WebView can clear what is left.
+            Log.w("JapscanReader", "captcha still up after $captchaRounds rounds, asking the user to solve it")
+            askUserForWebViewCaptcha(chapterUrl, isReader)
+            val afterUser = capturePages(chapterUrl, urlSegment, isWebtoon)
+            captured = afterUser.first
+            completed = afterUser.second
+        }
+        // The site intermittently serves the reader with an empty page list: the HTML is the real
+        // chapter page, but it carries no pages and no third-party script. Nothing on our side
+        // provokes it, and a later attempt gets a good page, so retry with a growing pause instead
+        // of treating it as an empty chapter.
+        for ((attempt, pause) in CAPTURE_BACKOFF.withIndex()) {
+            if (captured.isNotEmpty()) break
+            Log.w(
+                "JapscanReader",
+                "empty capture with webtoon=$isWebtoon, retry ${attempt + 1}/${CAPTURE_BACKOFF.size} in ${pause.inWholeSeconds}s",
+            )
+            delay(pause)
+            val retry = capturePages(chapterUrl, urlSegment, isWebtoon)
+            captured = retry.first
+            completed = retry.second
         }
         if (captured.isEmpty()) {
             Log.w(
@@ -366,72 +431,19 @@ abstract class Japscan :
             )
         }
         if (captured.isEmpty()) {
-            Log.w("JapscanReader", "getPageList finished with zero page: $chapterUrl")
-            throw Exception("Aucune page trouvée pour ce chapitre (chapitre vide ou supprimé sur Japscan)")
+            Log.w("JapscanReader", "getPageList finished with zero page: $chapterUrl (captcha=${readerJsInterface.captchaSeen})")
+            // A captcha the solver could not answer looks nothing like an empty chapter, and saying
+            // so is the difference between "retry" and "this chapter is gone".
+            throw if (readerJsInterface.captchaSeen) {
+                Exception("Le captcha de Japscan n'a pas pu être résolu. Réessaie : la tentative suivante part souvent d'une nouvelle série d'images.")
+            } else {
+                Exception("Aucune page trouvée pour ce chapitre (chapitre vide ou supprimé sur Japscan)")
+            }
         }
         return captured.mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
     }
 
-    /** One GET of a chapter page: the URL it finally landed on, and whether a captcha is up. */
-    private data class ChapterProbe(val finalUrl: HttpUrl, val captchaUp: Boolean)
-
-    /**
-     * Fetches the chapter page once, for both checks that follow it. They used to be two requests
-     * of the same HTML, and the client's 2 s rate limit made each of them cost a full round trip
-     * for a single bit of information.
-     */
-    private suspend fun probeChapter(chapterUrl: String): ChapterProbe {
-        val response = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK)
-        val finalUrl = response.request.url
-        val body = response.use { it.body.string() }
-        return ChapterProbe(finalUrl, CAPTCHA_REGEX.containsMatchIn(body))
-    }
-
-    /**
-     * Fails with a readable message when the chapter page redirected somewhere else.
-     *
-     * Japscan keeps dead chapters in its listings: their URL answers a redirect to the manga page,
-     * whose reader then yields zero pages. Checking the final URL turns that into an explicit error
-     * instead of an empty chapter.
-     */
-    private fun checkChapterRedirect(requested: HttpUrl, finalUrl: HttpUrl) {
-        val requestedSegments = requested.pathSegments.filter(String::isNotEmpty)
-        val finalSegments = finalUrl.pathSegments.filter(String::isNotEmpty)
-        Log.d(
-            "JapscanReader",
-            "redirect check: requested=/${requestedSegments.joinToString("/")} " +
-                "final=/${finalSegments.joinToString("/")}",
-        )
-
-        // Cosmetic normalisation (missing or extra trailing slash, same path): nothing to report.
-        if (requestedSegments == finalSegments) return
-
-        // A dead chapter drops its last segment and lands on the manga page (or the catalogue).
-        // Only that shape is fatal: any other redirect (http→https, other host, query rewrite) is
-        // the site normalising the URL and must not block reading.
-        val chapterDropped = finalSegments.isNotEmpty() &&
-            finalSegments.size < requestedSegments.size &&
-            requestedSegments.take(finalSegments.size) == finalSegments
-        if (chapterDropped) {
-            throw Exception("Ce chapitre n'existe plus sur Japscan : il redirige vers $finalUrl")
-        }
-        Log.d("JapscanReader", "redirect ignored (URL normalisation): $finalUrl")
-    }
-
-    private suspend fun captchaPresent(chapterUrl: String): Boolean = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK).use {
-        CAPTCHA_REGEX.containsMatchIn(it.body.string())
-    }
-
-    private suspend fun solveCaptcha(chapterUrl: String, captchaUp: Boolean, isReader: Boolean) {
-        if (!captchaUp) return
-
-        // Cold sessions usually get past the captcha after loading the homepage once in a WebView
-        warmupWebViewSession()
-        if (!captchaPresent(chapterUrl)) return
-
-        // Attempt automatic custom Japscan challenge solving first
-        if (trySolveCustomChallenge(chapterUrl)) return
-
+    private fun openCaptchaWebView(chapterUrl: String) {
         val context = applicationContext
         try {
             val intent = Intent().apply {
@@ -446,87 +458,86 @@ abstract class Japscan :
             // Suwayomi etc.
             throw Exception("Résolvez le captcha de ce chapitre depuis la WebView et réouvrez le chapitre.")
         }
-        repeat(CAPTCHA_MAX_POLLS) {
-            delay(CAPTCHA_POLL_INTERVAL)
-            if (!captchaPresent(chapterUrl)) {
-                val closeIntent = Intent().apply {
-                    val targetClass = if (isReader) {
-                        "eu.kanade.tachiyomi.ui.reader.ReaderActivity"
-                    } else {
-                        "eu.kanade.tachiyomi.ui.main.MainActivity"
-                    }
-                    component = ComponentName(context, targetClass)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                }
-                context.startActivity(closeIntent)
-                return
-            }
-        }
-        throw Exception("Résolvez le captcha, fermez la Webview et réouvrez le chapitre.")
     }
 
-    private suspend fun trySolveCustomChallenge(chapterUrl: String): Boolean {
-        var autoCaptchaTry = 0
-        var pageContent = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK).use { it.body.string() }
+    /**
+     * Last resort: the site captcha that only a real WebView sees survived every automatic attempt,
+     * so open the visible WebView and give the user a moment before retrying.
+     */
+    private suspend fun askUserForWebViewCaptcha(chapterUrl: String, isReader: Boolean) {
+        warmupWebViewSession()
+        openCaptchaWebView(chapterUrl)
+        delay(CAPTCHA_WEBVIEW_WAIT)
+        // Leaving the WebView on screen once the challenge is cleared is just in the way.
+        closeVisibleWebView(isReader)
+    }
 
-        while (autoCaptchaTry < 3) {
-            val stripsMatch = STRIPS_ARRAY_REGEX.find(pageContent)
-            val stripsContent = stripsMatch?.groupValues?.get(1).orEmpty()
-            val tokenMatch = TOKEN_REGEX.find(pageContent)
-
-            if (stripsContent.isNotEmpty() && tokenMatch != null) {
-                Log.d("JapscanDebug", "Captcha detected on try #$autoCaptchaTry - token found")
-                val items = ELEMENT_REGEX.findAll(stripsContent).map {
-                    val uuid = it.groupValues[1]
-                    val src = it.groupValues[2]
-                    uuid to src
-                }.toList()
-
-                if (items.size == 4) {
-                    val solved = runCatching {
-                        val answer = orderUuidsByImageVerticality(items)
-                        Log.d("JapscanDebug", "Captcha ordered UUIDs: $answer")
-                        val token = tokenMatch.groupValues[1]
-                        val multipartBody = MultipartBody.Builder()
-                            .setType(MultipartBody.FORM)
-                            .addFormDataPart("token", token)
-                            .addFormDataPart("answer", answer.toJsonString())
-                            .build()
-
-                        val captchaRequest = Request.Builder()
-                            .url("$baseUrl/validate-captcha/")
-                            .header("Referer", chapterUrl)
-                            .post(multipartBody)
-                            .build()
-
-                        client.newCall(captchaRequest).execute().use { resp ->
-                            val body = resp.body.string()
-                            Log.d("JapscanDebug", "Captcha response: $body")
-                            body.contains(CAPTCHA_SUCCESS_REGEX)
-                        }
-                    }.getOrDefault(false)
-
-                    if (solved) {
-                        Log.d("JapscanDebug", "Captcha solved successfully! Verifying...")
-                        pageContent = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK).use { it.body.string() }
-                        if (!CAPTCHA_REGEX.containsMatchIn(pageContent)) {
-                            Log.d("JapscanDebug", "Captcha cleared after solve!")
-                            return true
-                        }
-                    } else {
-                        Log.d("JapscanDebug", "Captcha solving attempt #$autoCaptchaTry failed. Re-fetching chapter...")
-                        pageContent = client.get(chapterUrl, Fetch.NONE, CacheControl.FORCE_NETWORK).use { it.body.string() }
-                    }
-                } else {
-                    Log.d("JapscanDebug", "Captcha items count is not 4: ${items.size}")
-                }
-                autoCaptchaTry++
+    private fun closeVisibleWebView(isReader: Boolean) {
+        val context = applicationContext
+        runCatching {
+            val target = if (isReader) {
+                "eu.kanade.tachiyomi.ui.reader.ReaderActivity"
             } else {
-                Log.d("JapscanDebug", "No strips or token detected in page content.")
-                break
+                "eu.kanade.tachiyomi.ui.main.MainActivity"
             }
+            context.startActivity(
+                Intent().apply {
+                    component = ComponentName(context, target)
+                    addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                    )
+                },
+            )
+        }.onFailure { Log.d("JapscanReader", "could not close the visible WebView: ${it.message}") }
+    }
+
+    /**
+     * Solves the strip-ordering captcha from any page HTML: the copy the HTTP client got, or the one
+     * the WebView fetched for itself when the captcha is only shown to a real browser.
+     */
+    private fun solveChallengeFromHtml(pageHtml: String, chapterUrl: String): Boolean {
+        val stripsContent = STRIPS_ARRAY_REGEX.find(pageHtml)?.groupValues?.get(1).orEmpty()
+        val token = TOKEN_REGEX.find(pageHtml)?.groupValues?.get(1) ?: return false
+        if (stripsContent.isEmpty()) return false
+
+        val items = ELEMENT_REGEX.findAll(stripsContent).map {
+            it.groupValues[1] to it.groupValues[2]
+        }.toList()
+        if (items.size != 4) {
+            Log.d("JapscanDebug", "Captcha items count is not 4: ${items.size}")
+            return false
         }
-        return !CAPTCHA_REGEX.containsMatchIn(pageContent)
+        val answers = runCatching { orderUuidsByImageVerticalityRanked(items, CAPTCHA_ATTEMPTS) }
+            .getOrDefault(emptyList())
+        if (answers.isEmpty()) return false
+        // The scoring is a heuristic and the site accepts several answers per token: submit the
+        // best candidate, then the next best ones, instead of stopping at the first miss.
+        for (answer in answers) {
+            Log.d("JapscanDebug", "Captcha ordered UUIDs: $answer")
+            val accepted = runCatching {
+                val multipartBody = MultipartBody.Builder()
+                    .setType(MultipartBody.FORM)
+                    .addFormDataPart("token", token)
+                    .addFormDataPart("answer", answer.toJsonString())
+                    .build()
+
+                val captchaRequest = Request.Builder()
+                    .url("$baseUrl/validate-captcha/")
+                    .header("Referer", chapterUrl)
+                    .post(multipartBody)
+                    .build()
+
+                client.newCall(captchaRequest).execute().use { resp ->
+                    val body = resp.body.string()
+                    Log.d("JapscanDebug", "Captcha response: $body")
+                    body.contains(CAPTCHA_SUCCESS_REGEX)
+                }
+            }.getOrDefault(false)
+            if (accepted) return true
+        }
+        return false
     }
 
     private suspend fun warmupWebViewSession() {
@@ -550,28 +561,41 @@ abstract class Japscan :
      * @return Saved page paths, empty when the reader produced nothing.
      */
     private suspend fun capturePages(chapterUrl: String, urlSegment: String, isWebtoon: Boolean): Pair<List<String>, Boolean> {
-        val interfaceName = randomString()
         // Pages travel over a loopback socket when it can be started; the bridge stays the
         // fallback for every page the socket does not take.
         val receiver = runCatching { PageReceiver(applicationContext.cacheDir) }
             .onFailure { Log.w("JapscanReader", "page receiver unavailable: ${it.message}") }
             .getOrNull()
-        val jsInterface = JsInterface(applicationContext.cacheDir, receiver)
+        val jsInterface = readerJsInterface
+        jsInterface.begin(receiver)
         // Without this the socket capture looks idle to the watchdog and gets cut short.
         receiver?.onPage = { jsInterface.activity.trySend(Unit) }
-        val userAgent = headers["User-Agent"]
         Log.d("JapscanReader", "capturePages: webtoon=$isWebtoon url=$chapterUrl")
 
+        // The WebView is deliberately left to obtain and keep its own Cloudflare clearance. The
+        // probe above already spent the OkHttp one on a different TLS fingerprint, and Cloudflare
+        // burns a clearance it sees used by two clients: the first chapter worked, every later one
+        // came back as a reader with no pages.
         val webView = withContext(Dispatchers.Main) {
-            createReaderWebView(
+            val request = CaptureRequest(
                 chapterUrl = chapterUrl,
-                isWebtoon = isWebtoon,
                 urlSegment = urlSegment,
-                interfaceName = interfaceName,
-                jsInterface = jsInterface,
-                userAgent = userAgent,
+                isWebtoon = isWebtoon,
+                interfaceName = readerInterfaceName ?: randomString().also { readerInterfaceName = it },
                 uploadUrl = receiver?.baseUrl.orEmpty(),
             )
+            captureRequest = request
+            redirectedTo = null
+            seenRequests.clear()
+            idleHandler.removeCallbacksAndMessages(null)
+            val view = readerWebView ?: createReaderWebView().also { readerWebView = it }
+            // Priming loads the homepage first, and the page-finished callback then navigates to
+            // the chapter. Skipping the hop has to skip the homepage load too, otherwise the
+            // driver runs on the homepage instead of the chapter.
+            // Straight to the chapter: the homepage hop it used to take was never needed, the
+            // failures it "fixed" were the site captcha, handled on its own now.
+            view.loadUrl(chapterUrl, headers.toMap())
+            view
         }
         try {
             // Progress-based budget: a 160-page chapter legitimately takes minutes, so the run is
@@ -605,10 +629,29 @@ abstract class Japscan :
                 }.onFailure { Log.w("JapscanReader", "page probe failed: ${it.message}") }.getOrNull()
             }
             Log.w("JapscanReader", "page probe: $probe (webtoon=$isWebtoon)")
-            withContext(NonCancellable + Dispatchers.Main) { runCatching { webView.destroy() } }
+            // The WebView is kept for the next chapter: destroying it is what made every other
+            // capture come back as an empty shell. It is released once nothing asks for it.
+            val finished = captureRequest
+            withContext(NonCancellable + Dispatchers.Main) {
+                idleHandler.removeCallbacksAndMessages(null)
+                idleHandler.postDelayed(
+                    {
+                        if (captureRequest === finished) {
+                            runCatching { readerWebView?.destroy() }
+                            readerWebView = null
+                            captureRequest = null
+                            Log.d("JapscanReader", "reader WebView released after inactivity")
+                        }
+                    },
+                    WEBVIEW_IDLE_MS,
+                )
+            }
             receiver?.close()
         }
 
+        redirectedTo?.let { finalUrl ->
+            throw Exception("Ce chapitre n'existe plus sur Japscan : il redirige vers $finalUrl")
+        }
         val captured = receiver?.snapshot().orEmpty() + jsInterface.snapshot()
         val completed = jsInterface.done.isCompleted
         Log.d(
@@ -621,23 +664,18 @@ abstract class Japscan :
     // A manual WebView instead of runWebView: the long-strip reader needs a forced desktop-sized
     // viewport, otherwise it only renders one tile per page.
     @SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
-    private fun createReaderWebView(
-        chapterUrl: String,
-        isWebtoon: Boolean,
-        urlSegment: String,
-        interfaceName: String,
-        jsInterface: JsInterface,
-        userAgent: String?,
-        uploadUrl: String,
-    ): WebView = WebView(applicationContext).apply {
+    private fun createReaderWebView(): WebView = WebView(applicationContext).apply {
         settings.domStorageEnabled = true
         settings.javaScriptEnabled = true
         settings.blockNetworkImage = false
         // Keep the UA matched to the rest of the traffic so Cloudflare doesn't challenge again;
         // the desktop appearance the descrambler needs is faked at the JS layer.
-        settings.userAgentString = userAgent
+        settings.userAgentString = headers["User-Agent"]
         setLayerType(View.LAYER_TYPE_SOFTWARE, null)
-        if (isWebtoon) {
+        // A WebView that is never attached to a window gets a waived renderer, and the reader's
+        // bootstrap is throttled hard enough that it never mounts within the capture window.
+        setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+        if (captureRequest?.isWebtoon == true) {
             settings.useWideViewPort = true
             settings.loadWithOverviewMode = false
             measure(
@@ -646,7 +684,7 @@ abstract class Japscan :
             )
             layout(0, 0, WEBVIEW_VIEWPORT_WIDTH, WEBVIEW_VIEWPORT_HEIGHT)
         }
-        addJavascriptInterface(jsInterface, interfaceName)
+        addJavascriptInterface(readerJsInterface, readerInterfaceName!!)
 
         // The renderer's own explanation of a failed request (CSP, mixed content, ...) is the only
         // way to tell those apart from a socket that is simply not listening.
@@ -667,11 +705,20 @@ abstract class Japscan :
             // so only the origins the reader needs are allowed. Every blocked host is logged once:
             // an over-eager allowlist is invisible otherwise, and it looks exactly like a chapter
             // whose reader never mounts.
-            val blockedHosts = mutableSetOf<String>()
+            val blockedHosts = Collections.synchronizedSet(mutableSetOf<String>())
+
             override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest): WebResourceResponse? {
                 val host = request.url.host ?: return null
                 // The page receiver lives on loopback; blocking it would break our own uploads.
                 if (host == LOOPBACK_HOST) return null
+                if (ALLOWED_HOSTS.any { host == it || host.endsWith(".$it") }) {
+                    val path = request.url.encodedPath ?: ""
+                    if (!request.isForMainFrame && path.isNotEmpty() && !path.startsWith("/uploads/") &&
+                        seenRequests.size < 40 && seenRequests.add(path)
+                    ) {
+                        Log.d("JapscanReader", "req: $path")
+                    }
+                }
                 return if (ALLOWED_HOSTS.any { host == it || host.endsWith(".$it") }) {
                     null
                 } else {
@@ -685,8 +732,12 @@ abstract class Japscan :
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                val request = captureRequest ?: return
                 view?.evaluateJavascript(ACLIB_STUB, null)
-                view?.evaluateJavascript(if (isWebtoon) webtoonHooks(interfaceName) else paginatedHook(interfaceName), null)
+                view?.evaluateJavascript(
+                    if (request.isWebtoon) webtoonHooks(request.interfaceName) else paginatedHook(request.interfaceName),
+                    null,
+                )
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
@@ -694,16 +745,22 @@ abstract class Japscan :
                 // Keep the detached WebView's JS timers running
                 view?.onResume()
                 view?.resumeTimers()
-                val driver = if (isWebtoon) {
-                    webtoonDriver(interfaceName, urlSegment)
+                val request = captureRequest ?: return
+                // The browser is the only thing that follows the site's redirects now, so this is
+                // where a dead chapter (whose URL lands on the manga page) is detected.
+                if (url != null && !url.trimEnd('/').equals(request.chapterUrl.trimEnd('/'), ignoreCase = true)) {
+                    redirectedTo = url
+                }
+                val driver = if (request.isWebtoon) {
+                    webtoonDriver(request.interfaceName, request.urlSegment)
                 } else {
-                    paginatedDriver(interfaceName, uploadUrl)
+                    paginatedDriver(request.interfaceName, request.uploadUrl)
                 }
                 view?.evaluateJavascript(driver, null)
             }
         }
 
-        loadUrl(chapterUrl, headers.toMap())
+        // No load here: the caller starts the warmup navigation so it can rearm the state first.
     }
 
     // Spooled pages must outlive the chapter being read (the reader may re-request them or
@@ -761,7 +818,9 @@ abstract class Japscan :
      * call order. Every failure is non-fatal: the driver falls back to the bridge.
      */
     private class PageReceiver(private val cacheDir: File) : Closeable {
-        private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}"
+        // A random suffix: two downloads started in the same millisecond would otherwise write
+        // the same files and overwrite each other's pages.
+        private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}-${UUID.randomUUID()}"
         private val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
         private val received = mutableListOf<File>()
 
@@ -820,8 +879,12 @@ abstract class Japscan :
             reply(socket, 204)
         }
 
+        // Per receiver: two chapters captured in parallel are two receivers on two threads, and a
+        // shared buffer would interleave their bytes into each other's pages.
+        private val copyBuffer = ByteArray(64 * 1024)
+
         private fun copyExactly(input: InputStream, out: OutputStream, length: Int) {
-            val buffer = COPY_BUFFER
+            val buffer = copyBuffer
 
             var remaining = length
             while (remaining > 0) {
@@ -902,10 +965,6 @@ abstract class Japscan :
 
         private companion object {
             private const val SOCKET_TIMEOUT_MS = 10_000
-
-            // Reused across pages: a fresh 64 KB array per page is 12 MB of garbage per chapter.
-            // The accept loop handles one connection at a time, so a shared buffer is safe.
-            private val COPY_BUFFER = ByteArray(64 * 1024)
             private const val MAX_HEADER_LINE = 8 * 1024
         }
     }
@@ -914,17 +973,50 @@ abstract class Japscan :
         repeat(length) { append(INTERFACE_NAME_CHARS.random()) }
     }
 
-    private class JsInterface(
-        private val cacheDir: File,
-        private val receiver: PageReceiver?,
-    ) {
-        val done = CompletableDeferred<Unit>()
+    private class JsInterface(private val cacheDir: File) {
+        // Recreated per capture: a CompletableDeferred completes once, and the WebView that owns
+        // this interface is now reused across chapters.
+        @Volatile
+        var done = CompletableDeferred<Unit>()
+
         val activity = Channel<Unit>(Channel.CONFLATED)
 
+        @Volatile
+        private var receiver: PageReceiver? = null
+
+        /** Set when the WebView landed on the site's own captcha page during this capture. */
+        @Volatile
+        var captchaSeen = false
+
+        /** Set when the WebView was stopped by a Cloudflare challenge instead. */
+        @Volatile
+        var cloudflareSeen = false
+
+        /** The captcha page as the WebView saw it, so the same solver can run on it. */
+        @Volatile
+        var captchaPageHtml: String? = null
+
         private val savedPaths: MutableList<String> = Collections.synchronizedList(mutableListOf())
-        private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}"
+
+        // Fresh per capture: reusing the previous tag would overwrite pages the reader or the
+        // downloader still has open.
+        @Volatile
+        private var sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}-${UUID.randomUUID()}"
 
         fun snapshot(): List<String> = synchronized(savedPaths) { savedPaths.toList() }
+
+        /** Rearms this interface for a new chapter. */
+        fun begin(receiver: PageReceiver?) {
+            done = CompletableDeferred()
+            captchaSeen = false
+            cloudflareSeen = false
+            captchaPageHtml = null
+            this.receiver = receiver
+            sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}-${UUID.randomUUID()}"
+            synchronized(savedPaths) { savedPaths.clear() }
+            // Drop anything the previous chapter's driver left queued.
+            while (activity.tryReceive().isSuccess) { }
+        }
 
         @JavascriptInterface
         @Suppress("UNUSED")
@@ -969,6 +1061,33 @@ abstract class Japscan :
             }
             receiver?.clear()
             Log.d("JapscanReader", "resetPages: cache cleared")
+        }
+
+        @JavascriptInterface
+        @Suppress("UNUSED")
+        fun captchaNeeded() {
+            captchaSeen = true
+            activity.trySend(Unit)
+        }
+
+        @JavascriptInterface
+        @Suppress("UNUSED")
+        fun cloudflareNeeded() {
+            cloudflareSeen = true
+            activity.trySend(Unit)
+        }
+
+        @JavascriptInterface
+        @Suppress("UNUSED")
+        fun captchaPage(html: String) {
+            captchaPageHtml = html
+            activity.trySend(Unit)
+        }
+
+        @JavascriptInterface
+        @Suppress("UNUSED")
+        fun keepAlive() {
+            activity.trySend(Unit)
         }
 
         @JavascriptInterface
@@ -1029,7 +1148,6 @@ abstract class Japscan :
         )
         private val CHAPTER_NUM_REGEX = Regex("""(?i)chapitre\s+([\d.]+)""")
         private val NON_NUMBER_REGEX = Regex("[^0-9.]+")
-        private val CAPTCHA_REGEX = """window\.__captcha\s*=\s*\{\s*needed\s*:\s*true\s*,?""".toRegex()
         private val CAPTCHA_SUCCESS_REGEX = Regex(""""success":\s*true""")
         private val DATE_FORMAT = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.US)
         private val PARIS = ZoneId.of("Europe/Paris")
@@ -1057,8 +1175,21 @@ abstract class Japscan :
         /** Minimum delay between two sweeps of the spool directory. */
         private const val PAGE_CACHE_SWEEP_INTERVAL_MS = 60 * 60 * 1000L
         private val IDLE_TIMEOUT = 10.seconds
-        private val CAPTCHA_POLL_INTERVAL = 5.seconds
-        private const val CAPTCHA_MAX_POLLS = 15
+
+        /** Pauses before re-capturing a chapter the site answered with an empty reader. */
+        private val CAPTURE_BACKOFF = listOf(5.seconds, 15.seconds, 45.seconds)
+
+        /** How long the shared reader WebView is kept once no capture is using it. */
+        private const val WEBVIEW_IDLE_MS = 5 * 60 * 1000L
+
+        /** Candidate orders submitted for one captcha, best first. */
+        private const val CAPTCHA_ATTEMPTS = 3
+
+        /** Fresh captchas tried (by reloading the chapter) before handing over to the user. */
+        private const val CAPTCHA_REFRESH_ATTEMPTS = 3
+
+        /** Time given to the user to clear a captcha that only the WebView shows. */
+        private val CAPTCHA_WEBVIEW_WAIT = 25.seconds
 
         // Under ~1280px wide the long-strip reader lazy-loads tiles on scroll, which a detached
         // WebView can't trigger; above it every tile host is created upfront.

@@ -168,7 +168,13 @@ fun generatePermutations(n: Int): List<List<Int>> {
     return results
 }
 
-fun findBestVerticalOrder(cost: Array<LongArray>, heights: List<Int>): List<Int> {
+/**
+ * The [limit] most plausible vertical orders, best first.
+ *
+ * The site accepts a few wrong answers per token, and the scoring above is a heuristic, so trying
+ * the next best candidates beats giving up on the first miss.
+ */
+fun rankVerticalOrders(cost: Array<LongArray>, heights: List<Int>, limit: Int = 1): List<List<Int>> {
     val n = cost.size
     require(n == 4) { "Exactly four segments were expected." }
     val allPerms = generatePermutations(n)
@@ -182,29 +188,27 @@ fun findBestVerticalOrder(cost: Array<LongArray>, heights: List<Int>): List<Int>
         allPerms
     }
 
-    var bestScore = Long.MAX_VALUE
-    var bestPerm = candidatePerms.firstOrNull() ?: allPerms.first()
-    for (p in candidatePerms) {
+    val scored = candidatePerms.map { perm ->
         var score: Long = 0
-        for (k in 0 until n - 1) {
-            score += cost[p[k]][p[k + 1]]
-            if (score >= bestScore) break
-        }
-        if (score < bestScore) {
-            bestScore = score
-            bestPerm = p
-        }
+        for (k in 0 until n - 1) score += cost[perm[k]][perm[k + 1]]
+        perm to score
     }
-    return bestPerm
+    return scored.sortedBy { it.second }.take(limit).map { it.first }
+        .ifEmpty { listOf(allPerms.first()) }
 }
 
-fun orderUuidsByImageVerticality(items: List<Pair<String, String>>): List<String> {
+fun findBestVerticalOrder(cost: Array<LongArray>, heights: List<Int>): List<Int> = rankVerticalOrders(cost, heights, 1).first()
+
+fun orderUuidsByImageVerticality(items: List<Pair<String, String>>): List<String> = orderUuidsByImageVerticalityRanked(items, 1).first()
+
+/** The [limit] most plausible orders, best first. Decodes and scores the slices only once. */
+fun orderUuidsByImageVerticalityRanked(items: List<Pair<String, String>>, limit: Int): List<List<String>> {
     require(items.size == 4) { "Exactly 4 Base64 segments are required." }
     val bitmaps = items.map { (_, src) -> decodeBase64ToImage(src) }
     try {
         val heights = bitmaps.map { it.height }
         val cost = computeCostMatrix(bitmaps)
-        return findBestVerticalOrder(cost, heights).map { items[it].first }
+        return rankVerticalOrders(cost, heights, limit).map { order -> order.map { items[it].first } }
     } finally {
         // Each slice is ~0.6 MB of native memory and is dead once the ordering is known.
         bitmaps.forEach { it.recycle() }

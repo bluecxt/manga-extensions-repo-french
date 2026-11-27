@@ -322,26 +322,134 @@ internal fun paginatedDriver(interfaceName: String, uploadUrl: String) = $$"""
                                     // The reader populates #pages from its own bootstrap, which can land
                                     // after onPageFinished. Reading it too early reported total = 0 and
                                     // gave up on a chapter that was merely still mounting.
-                                    var sel = null;
-                                    for (var mount = 0; mount < 80; mount++) {
-                                        sel = document.getElementById('pages');
-                                        if (sel && sel.options && sel.options.length > 0) break;
-                                        sel = null;
-                                        // Pages already rendering mean the reader is mounted, page
-                                        // count or not: stop waiting and let the pump start.
-                                        if (created() > 0) break;
-                                        if (mount === 30) {
-                                            window.__jlog('[japscan] still mounting: selects=' +
-                                                document.querySelectorAll('select').length +
-                                                ' pagesEl=' + !!document.getElementById('pages') +
-                                                ' title=' + document.title);
+                                    // A cold renderer needs well over 8 s to run the reader bootstrap,
+                                    // so the wait is 20 s and it pings the watchdog: without the ping
+                                    // the capture is cut after 10 s of silence.
+                                    // Waits for the reader to publish its page list. Bails out as
+                                    // soon as a page renders, page count or not.
+                                    async function mountWait(rounds) {
+                                        for (var m = 0; m < rounds; m++) {
+                                            var found = document.getElementById('pages');
+                                            if (found && found.options && found.options.length > 0) return found;
+                                            if (created() > 0) return null;
+                                            if (m % 10 === 0) {
+                                                try { window.$$interfaceName.keepAlive(); } catch(e) {}
+                                            }
+                                            // Cloudflare shows up within a second; reacting at
+                                            // once hands the window to the user instead of
+                                            // burning the whole mount budget first.
+                                            if (m >= 10) {
+                                                try {
+                                                    if (/just a moment|un instant|attention required/i.test(document.title || '')) {
+                                                        window.__jlog('[japscan] cloudflare challenge, handing over');
+                                                        return null;
+                                                    }
+                                                } catch(e) {}
+                                            }
+                                            // The captcha page never publishes a page list:
+                                            // react as soon as it shows up instead of burning
+                                            // the full twenty-second wait.
+                                            if (m >= 20) {
+                                                try {
+                                                    if (document.querySelector('script[src*="captcha"], link[href*="captcha"]')) {
+                                                        window.__jlog('[japscan] captcha page, no point waiting');
+                                                        return null;
+                                                    }
+                                                } catch(e) {}
+                                            }
+                                            if (m === 30) {
+                                                window.__jlog('[japscan] still mounting: selects=' +
+                                                    document.querySelectorAll('select').length +
+                                                    ' pagesEl=' + !!document.getElementById('pages') +
+                                                    ' title=' + document.title);
+                                            }
+                                            await sleep(100);
                                         }
-                                        await sleep(100);
+                                        return null;
+                                    }
+
+                                    var sel = await mountWait(200);
+
+                                    // The site sometimes answers the navigation with a degraded copy of
+                                    // the chapter page (real title, no page list), while a plain fetch
+                                    // from this very document gets the complete one. Ask again and swap
+                                    // the document in place: the hooks live on the window, so they
+                                    // survive the swap.
+                                    if (!sel && created() === 0) {
+                                        // Cloudflare's interstitial is not the site captcha: it needs
+                                        // a real browser window, exactly like the app does for any
+                                        // other request it cannot get through.
+                                        try {
+                                            if (/just a moment|un instant|attention required/i.test(document.title || '')) {
+                                                window.__jlog('[japscan] cloudflare challenge page');
+                                                window.$$interfaceName.cloudflareNeeded();
+                                            }
+                                        } catch(e) {}
+                                        // The site gates the reader behind its own captcha on some
+                                        // loads. The OkHttp probe never sees it (it answers the
+                                        // probe with the plain page), so the WebView has to say so.
+                                        try {
+                                            var captchaUp = !!window.__captcha ||
+                                                !!document.querySelector('script[src*="captcha"]') ||
+                                                !!document.querySelector('link[href*="captcha"]');
+                                            if (captchaUp) {
+                                                window.__jlog('[japscan] captcha page detected');
+                                                window.$$interfaceName.captchaNeeded();
+                                                // Hand the document over: the strips are in it and the
+                                                // Kotlin solver already knows how to order them. Awaited
+                                                // so the HTML is there before this driver finishes.
+                                                try {
+                                                    var captchaResp = await fetch(location.href, { credentials: 'same-origin' });
+                                                    window.$$interfaceName.captchaPage(await captchaResp.text());
+                                                } catch(e) {
+                                                    window.__jlog('[japscan] captcha page fetch failed: ' + e);
+                                                }
+                                            }
+                                        } catch(e) {}
+                                        var recovered = false;
+                                        try {
+                                            var refetched = await fetch(location.href, { credentials: 'same-origin' });
+                                            var pageHtml = await refetched.text();
+                                            var pagesBlock = pageHtml.match(/id="pages"[^>]*>([\s\S]*?)<\/select>/);
+                                            var pageOptions = pagesBlock ? (pagesBlock[1].match(/<option/g) || []).length : 0;
+                                            window.__jlog('[japscan] re-fetch self: status=' + refetched.status +
+                                                ' len=' + pageHtml.length + ' pageOptions=' + pageOptions +
+                                                ' reader=' + (pageHtml.indexOf('single-reader') >= 0));
+                                            if (pageOptions > 0) {
+                                                document.open();
+                                                document.write(pageHtml);
+                                                document.close();
+                                                recovered = true;
+                                                window.__jlog('[japscan] degraded page replaced by the fetched one');
+                                            }
+                                        } catch(e) {
+                                            window.__jlog('[japscan] re-fetch failed: ' + e);
+                                        }
+                                        if (recovered) sel = await mountWait(200);
                                     }
                                     // expected = 0 means the reader never published a page count. That is
                                     // not "zero pages": the reader still composites them and the hook
                                     // still sees every one, so the capture runs without the count.
                                     var expected = sel ? sel.options.length : 0;
+                                    if (expected === 0) {
+                                        // Tell an empty chapter apart from a page that never mounted:
+                                        // whatever the reader displays is the only clue we get.
+                                        var shown = '';
+                                        var html = '';
+                                        try {
+                                            shown = ((document.body && document.body.innerText) || '')
+                                                .replace(/\s+/g, ' ').slice(0, 120);
+                                            html = (document.documentElement && document.documentElement.outerHTML || '').slice(0, 300);
+                                        } catch(e) {}
+                                        window.__jlog('[japscan] no page list, ready=' + document.readyState +
+                                            ' nodes=' + document.querySelectorAll('*').length +
+                                            ' htmlLen=' + ((document.documentElement && document.documentElement.outerHTML) || '').length +
+                                            ' imgs=' + document.images.length +
+                                            ' url=' + location.href +
+                                            ' ref=' + (document.referrer || 'none') +
+                                            ' text=' + shown);
+                                        window.__jlog('[japscan] page html: ' + html);
+                                    }
                                     var total = expected || MAX_PAGES;
                                     window.__jlog('[japscan] paginated mode, total = ' + (expected || 'unknown') +
                                         ', next=' + !!nextBtn + ', prev=' + !!prevBtn +
