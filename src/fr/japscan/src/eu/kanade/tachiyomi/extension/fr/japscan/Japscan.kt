@@ -383,7 +383,7 @@ abstract class Japscan :
         // unexpected — captcha, degraded page, unknown reader build — falls back to the capture
         // below, which is still the only path that can learn a new alphabet.
         val mode = captureMode()
-        if (mode != CAPTURE_MODE_WEBVIEW && !cdnClosed()) {
+        if (mode != CAPTURE_MODE_WEBVIEW) {
             val fast = runCatchingCancellable { fastCapture(chapterUrl) }.getOrNull()
             if (fast != null) {
                 // A page the CDN refuses is not worth a WebView round trip, but it must not be
@@ -489,16 +489,6 @@ abstract class Japscan :
         return captured.mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
     }
 
-    /**
-     * Reports whether the CDN recently refused this client.
-     *
-     * Cloudflare answers an HTTP client it does not like with a 403 for every image, and even the
-     * chapter page request becomes slow while that lasts. One refusal parks the HTTP capture for
-     * [CDN_CLOSED_MS], so the chapters in between cost nothing, and the path is retried on its own
-     * once the window expires — the CDN reopens it when it feels like it.
-     */
-    private fun cdnClosed(): Boolean = System.currentTimeMillis() < preferences.getLong(CDN_CLOSED_UNTIL, 0L)
-
     /** Which capture the reader should try first; see the source preferences. */
     private fun captureMode(): String = preferences.getString(CAPTURE_MODE, CAPTURE_MODE_AUTO) ?: CAPTURE_MODE_AUTO
 
@@ -525,12 +515,17 @@ abstract class Japscan :
                     headers["User-Agent"]?.let { userAgent = it }
                     onPageFinished {
                         evaluateJs(browserFetcherScript(urls, receiver.baseUrl))
+                        var rounds = 0
                         poll(500.milliseconds) {
+                            rounds++
                             evaluateJs("String(window.__japscanFetchStatus || '')") { value ->
                                 val text = value.trim().trim('"')
-                                if (text.startsWith("ok") || text.startsWith("fail")) {
-                                    Log.d("JapscanReader", "http: page fetch said: $text")
-                                    resolve(text)
+                                when {
+                                    text.startsWith("ok") || text.startsWith("fail") -> {
+                                        Log.d("JapscanReader", "http: page fetch said: $text")
+                                        resolve(text)
+                                    }
+                                    rounds > 30 -> resolve("fail silent")
                                 }
                             }
                         }
@@ -548,9 +543,10 @@ abstract class Japscan :
 
     // Runs [urls] as parallel fetch calls in the page and uploads each under its index.
     private fun browserFetcherScript(urls: List<String>, uploadBase: String): String {
-        val json = urls.joinToString(",", "[", "]") { """ + it.replace("\"", "\\\"") + """ }
+        val json = urls.joinToString(",", "[", "]") { "\"" + it.replace("\"", "\\\"") + "\"" }
         return """
             (function () {
+              try {
               var urls = $json;
               var base = '$uploadBase';
               var limit = 6;
@@ -585,6 +581,7 @@ abstract class Japscan :
                   ? ('fail ' + failed.length + ' ' + failed.slice(0, 5).join(' | '))
                   : ('ok ' + urls.length);
               }).catch(function (error) { window.__japscanFetchStatus = 'fail init ' + error; });
+              } catch (error) { window.__japscanFetchStatus = 'fail script ' + error; }
             })();
         """.trimIndent()
     }
@@ -631,43 +628,21 @@ abstract class Japscan :
             return null
         }
 
-        val spool = httpCapture.spool(paths)
+        val fetchedStart = System.currentTimeMillis()
+        val fetched = runCatchingCancellable { browserFetchPages(paths, chapterUrl) }.getOrNull()
+        if (fetched == null || fetched.size != paths.size) {
+            Log.w(
+                "JapscanReader",
+                "http: page fetch got ${fetched?.size ?: 0}/${paths.size}, falling back to the reader capture",
+            )
+            return null
+        }
         Log.d(
             "JapscanReader",
             "http: ${paths.size} pages, markup=${htmlMs}ms learn=${learnedMs}ms " +
-                "download=${spool.elapsedMs}ms (${spool.paths.size} ok) total=${System.currentTimeMillis() - started}ms",
+                "fetch=${System.currentTimeMillis() - fetchedStart}ms total=${System.currentTimeMillis() - started}ms",
         )
-        // One missing page out of a hundred is the CDN, not us: the reader path would drop it too.
-        if (spool.refused) {
-            // The CDN refuses this client, not the browser: the page can fetch the same URLs with
-            // the fingerprint Cloudflare expects. Each image carries its position in the list, so
-            // the order is exact and no duplicate can shift the chapter.
-            val fetched = runCatchingCancellable { browserFetchPages(paths, chapterUrl) }.getOrNull()
-            if (fetched != null && fetched.size == paths.size) {
-                Log.d("JapscanReader", "http: ${paths.size} pages fetched from the page in ${System.currentTimeMillis() - started}ms")
-                return FastPages(fetched, complete = true)
-            }
-            Log.w("JapscanReader", "http: page fetch got ${fetched?.size ?: 0}/${paths.size}, parking the CDN")
-            preferences.edit().putLong(CDN_CLOSED_UNTIL, System.currentTimeMillis() + CDN_CLOSED_MS).apply()
-            return null
-        }
-        val missing = paths.size - spool.paths.size
-        if (missing > 0) {
-            // Keep the decrypted document around: the dead entry is either a placeholder this
-            // build signals with a marker we do not read yet, or a page the CDN really lost.
-            val dir = applicationContext.getExternalFilesDir(null)
-            runCatching {
-                val json = JapscanCrypto.rawJson(page, table)
-                if (dir != null && json != null) {
-                    File(dir, "japscan-payload-${System.currentTimeMillis()}.json").writeText(json)
-                }
-            }
-        }
-        return when {
-            missing == 0 -> FastPages(spool.paths, complete = true)
-            missing <= MAX_MISSING_PAGES -> FastPages(spool.paths, complete = false)
-            else -> null
-        }
+        return FastPages(fetched, complete = true)
     }
 
     /**
@@ -1440,15 +1415,8 @@ abstract class Japscan :
         /** Images in flight during an HTTP capture. */
         private const val FAST_CONCURRENCY = 8
 
-        /** Pages the CDN may refuse before the WebView takes over again. */
-        private const val MAX_MISSING_PAGES = 1
-
         /** How long the in-page download of a whole chapter may take. */
         private val BROWSER_FETCH_TIMEOUT = 4.minutes
-
-        /** How long the HTTP capture stays parked after a CDN refusal. */
-        private const val CDN_CLOSED_UNTIL = "cdn_closed_until"
-        private const val CDN_CLOSED_MS = 10 * 60 * 1000L
 
         /** SharedPreferences key prefix of the substitution alphabet of a reader build. */
         private const val TABLE_PREFIX = "alphabet_"
