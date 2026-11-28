@@ -1207,8 +1207,8 @@ abstract class Japscan :
         private val CAPTCHA_SUCCESS_REGEX = Regex(""""success":\s*true""")
         private val CAPTCHA_RATE_LIMIT_REGEX = Regex("""too_many_requests|Trop de tentatives""")
 
-        /** How long the site refuses captcha validations after a burst. */
-        private val CAPTCHA_COOLDOWN = 65.seconds
+        /** The site asks for a minute; retrying a little before it costs one validation, not nine. */
+        private val CAPTCHA_COOLDOWN = 45.seconds
         private val DATE_FORMAT = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.US)
         private val PARIS = ZoneId.of("Europe/Paris")
 
