@@ -390,12 +390,17 @@ abstract class Japscan :
             captured = afterChallenge.first
             completed = afterChallenge.second
         }
-        if (captured.isEmpty() && readerJsInterface.captchaSeen && System.currentTimeMillis() < captchaBlockedUntil) {
-            // A rate limit is not a captcha nobody can solve: the site simply refuses validations
-            // for a minute. Waiting is the transparent answer, and it is also the only one that
-            // does not spend more of the same budget.
+        // A rate limit is not a captcha nobody can solve: the site simply refuses validations for
+        // a minute, and waiting is both the transparent answer and the only one that does not
+        // spend more of the same budget. Several rounds, because the window restarts on every
+        // refused attempt and one wait rarely lands exactly on its end.
+        var cooldownRound = 0
+        while (captured.isEmpty() && readerJsInterface.captchaSeen &&
+            System.currentTimeMillis() < captchaBlockedUntil && cooldownRound < CAPTCHA_COOLDOWN_ROUNDS
+        ) {
+            cooldownRound++
             val wait = captchaBlockedUntil - System.currentTimeMillis()
-            Log.w("JapscanReader", "captcha rate-limited, waiting ${wait / 1000}s before asking the user")
+            Log.w("JapscanReader", "captcha rate-limited, waiting ${wait / 1000}s (round $cooldownRound)")
             delay(wait)
             val afterWait = capturePages(chapterUrl, urlSegment, isWebtoon)
             captured = afterWait.first
@@ -1207,8 +1212,11 @@ abstract class Japscan :
         private val CAPTCHA_SUCCESS_REGEX = Regex(""""success":\s*true""")
         private val CAPTCHA_RATE_LIMIT_REGEX = Regex("""too_many_requests|Trop de tentatives""")
 
-        /** The site asks for a minute; retrying a little before it costs one validation, not nine. */
-        private val CAPTCHA_COOLDOWN = 45.seconds
+        /** The site refuses for a minute after a burst; its own message is the only clock we have. */
+        private val CAPTCHA_COOLDOWN = 60.seconds
+
+        /** How many cooldowns getPageList waits out before handing the captcha to the user. */
+        private const val CAPTCHA_COOLDOWN_ROUNDS = 3
         private val DATE_FORMAT = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.US)
         private val PARIS = ZoneId.of("Europe/Paris")
 
