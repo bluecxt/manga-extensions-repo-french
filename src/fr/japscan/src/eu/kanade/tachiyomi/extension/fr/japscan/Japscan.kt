@@ -941,21 +941,46 @@ abstract class Japscan :
                 received.sortedBy { it.name.substringAfterLast('-').substringBefore('.').toIntOrNull() ?: 0 }
             }
             val paths = ArrayList<String>(ordered.size)
-            var previous: File? = null
+            // The reader creates a page twice on some renders, and the copy is not always next to
+            // the original: a duplicate that lands later consumes an index, shifts the whole
+            // chapter and leaves a page more than the site announces. Fingerprint every file and
+            // keep the first copy of each, wherever it landed.
+            val seen = HashMap<String, File>(ordered.size)
             for (file in ordered) {
-                val prev = previous
-                if (prev != null && file.length() == prev.length() &&
-                    file.readBytes().contentEquals(prev.readBytes())
-                ) {
-                    Log.d("JapscanReader", "receiver: dropped ${file.name}, duplicate of ${prev.name}")
+                val key = fingerprint(file)
+                val first = key?.let(seen::get)
+                if (first != null) {
+                    Log.d("JapscanReader", "receiver: dropped ${file.name}, duplicate of ${first.name}")
                     file.delete()
                     continue
                 }
-                previous = file
+                if (key != null) seen[key] = file
                 paths.add(file.absolutePath)
             }
             return paths
         }
+
+        // Size plus the first and last 64 KiB: a byte-identical page matches on all three, while
+        // two real pages of a chapter differ in at least one of them. Reading the whole file would
+        // cost 250 MB on a 165-page chapter.
+        private fun fingerprint(file: File): String? = runCatching {
+            val length = file.length()
+            if (length <= 0L) return@runCatching null
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(DUPLICATE_SAMPLE)
+            file.inputStream().use { input ->
+                val read = input.read(buffer)
+                if (read > 0) digest.update(buffer, 0, read)
+            }
+            if (length > 2L * DUPLICATE_SAMPLE) {
+                java.io.RandomAccessFile(file, "r").use { random ->
+                    random.seek(length - DUPLICATE_SAMPLE)
+                    val read = random.read(buffer)
+                    if (read > 0) digest.update(buffer, 0, read)
+                }
+            }
+            length.toString() + ":" + digest.digest().joinToString("") { "%02x".format(it) }
+        }.getOrNull()
 
         override fun close() {
             running = false
@@ -966,6 +991,7 @@ abstract class Japscan :
         private companion object {
             private const val SOCKET_TIMEOUT_MS = 10_000
             private const val MAX_HEADER_LINE = 8 * 1024
+            private const val DUPLICATE_SAMPLE = 64 * 1024
         }
     }
 
