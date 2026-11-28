@@ -620,12 +620,19 @@ abstract class Japscan :
             }
         }
 
-        val paths = JapscanCrypto.decrypt(page, table)
+        var paths = JapscanCrypto.decrypt(page, table)
         if (paths == null) {
-            // The alphabet belongs to the reader build: a failure means the site shipped a new one.
+            // The alphabet belongs to the reader build; one that does not fit is either stale or
+            // was captured wrong. Drop it, learn again from the live page and retry once.
             preferences.edit().remove(TABLE_PREFIX + build).apply()
-            Log.w("JapscanReader", "http: decryption failed for build $build, alphabet dropped")
-            return null
+            Log.w("JapscanReader", "http: decryption failed for build $build, learning again")
+            val relearned = learnTable(chapterUrl, build) ?: return null
+            paths = JapscanCrypto.decrypt(page, relearned)
+            if (paths == null) {
+                preferences.edit().remove(TABLE_PREFIX + build).apply()
+                Log.w("JapscanReader", "http: decryption still failed for build $build, giving up")
+                return null
+            }
         }
 
         val fetchedStart = System.currentTimeMillis()
@@ -1172,21 +1179,42 @@ abstract class Japscan :
                 received.sortedBy { it.name.substringAfterLast('-').substringBefore('.').toIntOrNull() ?: 0 }
             }
             val paths = ArrayList<String>(ordered.size)
-            var previous: File? = null
+            val seen = HashMap<String, File>(ordered.size)
             for (file in ordered) {
-                val prev = previous
-                if (prev != null && file.length() == prev.length() &&
-                    file.readBytes().contentEquals(prev.readBytes())
-                ) {
-                    Log.d("JapscanReader", "receiver: dropped ${file.name}, duplicate of ${prev.name}")
+                val key = fingerprint(file)
+                val first = key?.let(seen::get)
+                if (first != null) {
+                    Log.d("JapscanReader", "receiver: dropped ${file.name}, duplicate of ${first.name}")
                     file.delete()
                     continue
                 }
-                previous = file
+                if (key != null) seen[key] = file
                 paths.add(file.absolutePath)
             }
             return paths
         }
+
+        // Size plus the first and last 64 KiB: a byte-identical page matches on all three, while
+        // two real pages of a chapter differ in at least one of them. Reading whole files would
+        // cost 250 MB on a 165-page chapter.
+        private fun fingerprint(file: File): String? = runCatching {
+            val length = file.length()
+            if (length <= 0L) return@runCatching null
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            val buffer = ByteArray(DUPLICATE_SAMPLE)
+            file.inputStream().use { input ->
+                val read = input.read(buffer)
+                if (read > 0) digest.update(buffer, 0, read)
+            }
+            if (length > 2L * DUPLICATE_SAMPLE) {
+                java.io.RandomAccessFile(file, "r").use { random ->
+                    random.seek(length - DUPLICATE_SAMPLE)
+                    val read = random.read(buffer)
+                    if (read > 0) digest.update(buffer, 0, read)
+                }
+            }
+            length.toString() + ":" + digest.digest().joinToString("") { "%02x".format(it) }
+        }.getOrNull()
 
         override fun close() {
             running = false
@@ -1197,6 +1225,7 @@ abstract class Japscan :
         private companion object {
             private const val SOCKET_TIMEOUT_MS = 10_000
             private const val MAX_HEADER_LINE = 8 * 1024
+            private const val DUPLICATE_SAMPLE = 64 * 1024
         }
     }
 
