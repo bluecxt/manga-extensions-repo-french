@@ -41,7 +41,18 @@ Les dépôts parents configurés :
 - **cursed** : `https://github.com/yuzono/cursed-manga-extensions.git` (Branche : `main` — l'ancienne branche `master` a été supprimée upstream et fusionnée dans `main`)
 
 #### Dernière Maintenance
-- **Date :** 24 Novembre 2026
+- **Date :** 28 Novembre 2026
+- **État :**
+  - Remotes : `yuzono/main` = `54556b1406` (**48 commits** depuis le 24/11), `cursed/main` = `728635a04a` (inchangé).
+  - **Périmètre réel du fork :** `src/` ne contient que `fr` (40), `all` (23) et `en` (4) — les 45 modules touchés upstream comprennent donc beaucoup de sources absentes ici (`ar`, `es`, `id`, `ja`, `ko`, `pt`, `tr`, `vi`, `zh`). **Ne restaurer que les modules déjà suivis** : un `git restore` sur un chemin absent ressuscite une extension partielle (dossier sans `build.gradle.kts`) et casse `loadAllIndividualExtensions()`.
+  - **`core`** : `TurnstileHelper.kt` (overlay de check superposé à l'écran, #21415).
+  - **`lib-multisrc`** : `inkstory` (UA fixe retiré + Anubis, #21478), `libgroup` (parsing `site_ids` #21449, domaines `api.mangalib.me` / `api.cdnrulib.link` #21395), `madara` (`chapterAjaxPaginatedParam` ouvrable, #21413), `mangabox` (domaine `saiyanmanga.com`, #21453), `mmlook` (chapitres via le reader desktop, #21509), `mmrcms` (domaine, #21441).
+  - **Extensions resynchronisées :** `src/all/mangafire` (`versionCode = 41`, titres sans liens : `links` devient `JsonElement`, #21439), `src/en/manganelo` (`Manganato` déplacé sur `saiyanmanga.com`, `natomanga.com` passé en legacy, #21453).
+  - **Non importés (choix du fork) :** les 2 sources ajoutées upstream (`en/dorotoons`, `vi/hentaibox`) et les 7 retirées pour cause de site mort (`ar/orcamanga`, `en/scansgg`, `en/topmanhuanet`, `en/yaoihot`, `id/lianscans`, `id/manhwalistorg`, `id/tooncubus`) — aucune n'existait localement.
+  - **`src/fr/japscan` : exclue du sync.** Elle est désormais **100 % indépendante de son équivalent upstream** (voir la section *Extensions Custom*) : 48 commits upstream n'ont donc donné **aucune** modification FR.
+  - Validation : `./gradlew compileDebugKotlin` **BUILD SUCCESSFUL** + `assembleDebug` OK sur `mangafire` et `manganelo`.
+
+#### Maintenance Précédente (24 Novembre 2026)
 - **État :**
   - Remotes : `yuzono/main` = `dc4572c0fa` (**207 commits** depuis le 16/11), `cursed/main` = `728635a04a` (inchangé). `origin` en SSH → préfixer `PATH=/run/current-system/sw/bin:$PATH git ...`.
   - **Supprimées (sites morts, retirées upstream et vérifiées) :** `src/fr/bananascan` (`harmony-scan.fr`, DNS KO), `src/fr/histoiredhentai` (`hhentai.fr`, DNS KO), `src/fr/sushiscanfr` (`sushiscan.fr`, connexion refusée).
@@ -105,12 +116,15 @@ git restore --source=yuzono/main -- src/fr/nouvelle_extension
 | **pururin** | `cursed` | `src/all/pururin` |
 
 ### Extensions Custom / Modifiées (Ne pas écraser depuis l'upstream)
-- **`src/fr/japscan`** : Personnalisée avec intégration hybride :
-  - Migrée vers `libVersion = 1.6` (`KeiSource`, `ReaderScripts.kt`, `SearchResultDto.kt`, `warmupWebViewSession`).
-  - Conserve l'algorithme custom de résolution automatique de challenge d'images Japscan (`ImageUtils.kt` avec `orderUuidsByImageVerticality` et `trySolveCustomChallenge`).
-  - Intègre la bibliothèque locale `lib:twocaptcha` (résolution automatique Cloudflare Turnstile via `createCloudflareInterceptor`).
-  - Déchiffrement et chargement des pages via WebView dédiée (mangas paginés et manhwas/webtoons), déduplication SHA-256 et cache local.
-  - **Ne JAMAIS écraser Japscan depuis l'upstream sans préserver ces composants custom (`ImageUtils.kt`, challenge solver, `lib:twocaptcha`, intercepteur et préférences).**
+- **`src/fr/japscan`** : **100 % indépendante de l'upstream — ne JAMAIS la resynchroniser.**
+  - L'upstream (`yuzono/main`) contient encore un `src/fr/japscan`, mais notre version a divergé volontairement de ~1 600 lignes (3 fichiers locaux contre 4 upstream : `SearchResultDto.kt` supprimé, `ImageUtils.kt` ajouté).
+  - `versionCode = 77` avec le commentaire `// upstream: none` (numérotation fork, découplée de l'upstream).
+  - Capture des pages en **une passe via socket loopback** (`ServerSocket(0, 64, 127.0.0.1)`) plutôt que par le bridge JS — le bridge reste en repli.
+  - `ImageUtils.kt` : résolution automatique du challenge d'images Japscan (`orderUuidsByImageVerticality`, `trySolveCustomChallenge`).
+  - `ReaderScripts.kt` : scripts de lecture fork (déchiffrement, pilote WebView, timings) — 1 085 lignes contre 646 upstream ; `Japscan.kt` : 1 230 lignes contre 490 upstream.
+  - `lib:twocaptcha` (fork-only) pour la résolution Cloudflare Turnstile via `createCloudflareInterceptor`.
+  - Déduplication SHA-256 et cache local des pages.
+  - **Aucun `git restore --source=yuzono/main -- src/fr/japscan` : toute évolution Japscan se fait à la main, côté fork.**
 - **`src/all/niadd`** : Modifiée pour corriger le formatage et l'ordre des chapitres :
   - Parsing corrigé du nom de chapitre ciblant `span.chp-title` (évite de concaténer vues et date dans le titre).
   - Parsing étendu du numéro de chapitre (`CHAPTER_NUMBER_REGEX` gérant Vol/Volume, Ch/Chapitre, Capitulo).
@@ -128,6 +142,7 @@ git restore --source=yuzono/main -- src/fr/nouvelle_extension
 ## Mandats Spécifiques pour Gemini
 - Toujours vérifier `exclude_build.json` avant de se plaindre d'un build manquant.
 - Ne jamais restaurer les extensions supprimées (Dynasty, etc.) sans confirmation explicite.
-- Ne jamais écraser ou réinitialiser `src/fr/japscan`, `src/all/niadd`, `src/all/mangadex`, `src/all/mangaball` ou `src/all/hentaipaw` avec l'upstream sans préserver leurs composants et correctifs custom (blocs `BLC`, solveur Japscan, tri/parsing Niadd, filtres HentaiPaw).
+- Ne jamais écraser ou réinitialiser `src/all/niadd`, `src/all/mangadex`, `src/all/mangaball` ou `src/all/hentaipaw` avec l'upstream sans préserver leurs composants et correctifs custom (blocs `BLC`, tri/parsing Niadd, filtres HentaiPaw).
+- **`src/fr/japscan` est 100 % fork : sortir du périmètre de toute synchro upstream.** Ne jamais lancer `git restore`/`git checkout yuzono/main` dessus, ne pas la compter comme « en retard », et ne pas la modifier pendant un sync — ses évolutions sont manuelles et propres au fork.
 - `src/all/hentaipaw` est une extension 100 % fork : ne jamais la considérer comme « en retard » sur l'upstream ni la supprimer lors d'un nettoyage.
 - Maintenir la compatibilité `repo.json` pour Komikku lors de chaque modification du workflow de build.
