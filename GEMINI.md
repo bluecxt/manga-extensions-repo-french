@@ -50,7 +50,12 @@ Les dépôts parents configurés :
   - **Extensions resynchronisées :** `src/all/mangafire` (`versionCode = 41`, titres sans liens : `links` devient `JsonElement`, #21439), `src/en/manganelo` (`Manganato` déplacé sur `saiyanmanga.com`, `natomanga.com` passé en legacy, #21453).
   - **Non importés (choix du fork) :** les 2 sources ajoutées upstream (`en/dorotoons`, `vi/hentaibox`) et les 7 retirées pour cause de site mort (`ar/orcamanga`, `en/scansgg`, `en/topmanhuanet`, `en/yaoihot`, `id/lianscans`, `id/manhwalistorg`, `id/tooncubus`) — aucune n'existait localement.
   - **`src/fr/japscan` : exclue du sync.** Elle est désormais **100 % indépendante de son équivalent upstream** (voir la section *Extensions Custom*) : 48 commits upstream n'ont donc donné **aucune** modification FR.
-  - Validation : `./gradlew compileDebugKotlin` **BUILD SUCCESSFUL** + `assembleDebug` OK sur `mangafire` et `manganelo`.
+  - **16 extensions FR importées depuis `yuzono/main`** (le fork passe de 40 à 56 modules FR) : `hotmanga`, `mangaplexe`, `komiko`, `comicstracker`, `punkrecords`, `yureiscan`, `crunchyscanunoriginal`, `japscanst`, `mangadraftst`, `sushiscanst`, `mangasoriginesst`, `universotakust`, `softepsilonscan`, `mangasoriginesfr`, `mangahubfr`, `epsilonscan`.
+    - Thèmes `lib-multisrc` requis, déjà présents et identiques à l'upstream : `komiko` (hotmanga, komiko), `crunchyscanst` (les 6 « unoriginal »), `pam` (softepsilonscan, epsilonscan), `origines` (mangasoriginesfr), `madara` (mangahubfr).
+    - `exclude_build.json` : **retrait** de `fr.epsilonscan`, `fr.mangahubfr`, `fr.mangasoriginesfr`, `fr.softepsilonscan` (sinon les APK ne sont ni construits ni publiés).
+    - Sites : 6 en 200 direct (`hot-manga.fr`, `mangaplexe.com`, `komiko.io`, `comics-tracker.net`, `punkrecordz.com`, `yurei-scan.fr`) ; les 10 autres répondent **403 « Just a moment… » = challenge Cloudflare**, donc vivants (pas de DNS mort) et exploitables dans l'app.
+  - Validation : `./gradlew compileDebugKotlin` **BUILD SUCCESSFUL** + `assembleDebug` OK sur les 16 nouvelles et sur `mangafire` / `manganelo`.
+  - **Reste à importer (9 FR upstream) :** `banchanscan`, `blossomscans`, `chaostrad`, `dassouscan`, `hanabook`, `kanakonohast`, `onlyyaoiscantrad`, `onlyyuriscantrad`, `twatt`.
 
 #### Maintenance Précédente (24 Novembre 2026)
 - **État :**
