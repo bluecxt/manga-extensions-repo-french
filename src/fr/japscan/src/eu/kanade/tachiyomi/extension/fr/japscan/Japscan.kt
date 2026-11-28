@@ -46,6 +46,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.FormBody
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -55,6 +56,7 @@ import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import org.json.JSONArray
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.io.ByteArrayInputStream
@@ -184,25 +186,36 @@ abstract class Japscan :
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         if (query.isBlank()) return getPopularManga(page)
 
-        // Two catalogues, two listings: /mangas/ holds manga, manhwa and manhua while /bds/ is the
-        // Bande Dessinée catalogue. Both use the same markup and accept ?search=, so query both and
-        // de-duplicate, exactly like the server does.
-        val mangas = parseMangaList(
-            client.get(searchUrl("mangas", query, page), Fetch.NONE).asJsoup(),
-        )
-        val bds = runCatchingCancellable {
-            parseMangaList(client.get(searchUrl("bds", query, page), Fetch.NONE).asJsoup())
-        }.getOrNull()
+        // The site answers its live search with JSON on `POST /ls/`, and that is the only search
+        // route open to a plain client: the paginated catalogue (`/mangas/?search=`) sits behind
+        // Cloudflare and answers 403 without a browser session. The endpoint caps at 30 results
+        // and has no pagination, so a search is exactly one request and one page.
+        if (page > 1) return MangasPage(emptyList(), false)
 
-        val items = (mangas.mangas + (bds?.mangas ?: emptyList())).distinctBy { it.url }
-        return MangasPage(items, mangas.hasNextPage || bds?.hasNextPage == true)
+        val request = Request.Builder()
+            .url("$baseUrl/ls/")
+            .header("X-Requested-With", "XMLHttpRequest")
+            .post(FormBody.Builder().add("search", query).build())
+            .build()
+
+        val payload = runCatchingCancellable {
+            client.newCall(request).execute().use { response ->
+                if (response.isSuccessful) response.body.string() else null
+            }
+        }.getOrNull() ?: return MangasPage(emptyList(), false)
+
+        val results = runCatching { JSONArray(payload) }.getOrNull() ?: return MangasPage(emptyList(), false)
+        val mangas = (0 until results.length()).mapNotNull { index ->
+            val item = results.optJSONObject(index) ?: return@mapNotNull null
+            val url = item.optString("url").takeIf { it.isNotEmpty() } ?: return@mapNotNull null
+            SManga.create().apply {
+                setUrlWithoutDomain(url)
+                title = item.optString("name")
+                thumbnail_url = item.optString("image").takeIf { it.isNotEmpty() }?.let { baseUrl + it }
+            }
+        }
+        return MangasPage(mangas, false)
     }
-
-    /** Builds a `/<catalogue>/?search=…&p=…` listing URL for [catalogue]. */
-    private fun searchUrl(catalogue: String, query: String, page: Int): HttpUrl = "$baseUrl/$catalogue/".toHttpUrl().newBuilder()
-        .addQueryParameter("search", query)
-        .addQueryParameter("p", page.toString())
-        .build()
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
         if (url.host != baseUrl.toHttpUrl().host) return null
