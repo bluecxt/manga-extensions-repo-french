@@ -10,6 +10,7 @@ import android.util.Base64
 import android.util.Log
 import android.view.View
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -434,6 +435,9 @@ abstract class Japscan :
             Log.w("JapscanReader", "getPageList finished with zero page: $chapterUrl (captcha=${readerJsInterface.captchaSeen})")
             // A captcha the solver could not answer looks nothing like an empty chapter, and saying
             // so is the difference between "retry" and "this chapter is gone".
+            redirectedTo?.let { finalUrl ->
+                throw Exception("Ce chapitre n'existe plus sur Japscan : il redirige vers $finalUrl")
+            }
             throw if (readerJsInterface.captchaSeen) {
                 Exception("Le captcha de Japscan n'a pas pu être résolu. Réessaie : la tentative suivante part souvent d'une nouvelle série d'images.")
             } else {
@@ -468,8 +472,14 @@ abstract class Japscan :
         warmupWebViewSession()
         openCaptchaWebView(chapterUrl)
         delay(CAPTCHA_WEBVIEW_WAIT)
+        // The clearance the user earned has to reach the cookie store the capture WebView reads
+        // from, or the next attempt starts on the challenge again.
+        runCatching { CookieManager.getInstance().flush() }
         // Leaving the WebView on screen once the challenge is cleared is just in the way.
         closeVisibleWebView(isReader)
+        // Cloudflare commits its cookie just after the page settles; retrying instantly is what
+        // made a freshly cleared challenge look like an empty chapter.
+        delay(2.seconds)
     }
 
     private fun closeVisibleWebView(isReader: Boolean) {
@@ -649,9 +659,10 @@ abstract class Japscan :
             receiver?.close()
         }
 
-        redirectedTo?.let { finalUrl ->
-            throw Exception("Ce chapitre n'existe plus sur Japscan : il redirige vers $finalUrl")
-        }
+        // A redirect is treated as an empty capture, not as a verdict: the site also redirects
+        // transiently (rate limiting, challenge), and one more attempt usually lands on the real
+        // page. getPageList only reports the chapter as gone once every attempt hit it.
+        redirectedTo?.let { finalUrl -> Log.w("JapscanReader", "capture redirected to $finalUrl, treating it as empty") }
         val captured = receiver?.snapshot().orEmpty() + jsInterface.snapshot()
         val completed = jsInterface.done.isCompleted
         Log.d(
@@ -821,7 +832,11 @@ abstract class Japscan :
         // A random suffix: two downloads started in the same millisecond would otherwise write
         // the same files and overwrite each other's pages.
         private val sessionTag = "$CACHE_FILE_PREFIX${System.currentTimeMillis()}-${UUID.randomUUID()}"
-        private val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+
+        // The reader fires its uploads back to back, several of them before the previous reply
+        // lands: a small backlog drops connections and the pages are lost, so accept generously
+        // and serve each connection on its own thread.
+        private val server = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
         private val received = mutableListOf<File>()
 
         @Volatile
@@ -833,11 +848,16 @@ abstract class Japscan :
 
         val baseUrl: String = "http://127.0.0.1:${server.localPort}"
 
+        private val pool = java.util.concurrent.Executors.newFixedThreadPool(4) { runnable ->
+            Thread(runnable, "japscan-page").apply { isDaemon = true }
+        }
+
         private val worker = Thread(
             {
                 while (running) {
                     try {
-                        server.accept().use { readPage(it) }
+                        val socket = server.accept()
+                        pool.execute { socket.use { readPage(it) } }
                     } catch (e: Exception) {
                         if (running) Log.w("JapscanReader", "receiver: ${e.message}")
                     }
@@ -879,12 +899,12 @@ abstract class Japscan :
             reply(socket, 204)
         }
 
-        // Per receiver: two chapters captured in parallel are two receivers on two threads, and a
+        // One buffer per connection thread: the receiver serves several sockets at once, and a
         // shared buffer would interleave their bytes into each other's pages.
-        private val copyBuffer = ByteArray(64 * 1024)
+        private val copyBuffer = ThreadLocal.withInitial { ByteArray(64 * 1024) }
 
         private fun copyExactly(input: InputStream, out: OutputStream, length: Int) {
-            val buffer = copyBuffer
+            val buffer = copyBuffer.get()
 
             var remaining = length
             while (remaining > 0) {
@@ -961,6 +981,7 @@ abstract class Japscan :
         override fun close() {
             running = false
             runCatching { server.close() }
+            pool.shutdownNow()
         }
 
         private companion object {
