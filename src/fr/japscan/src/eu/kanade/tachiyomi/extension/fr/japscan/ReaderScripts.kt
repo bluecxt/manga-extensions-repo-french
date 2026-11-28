@@ -81,9 +81,11 @@ internal fun paginatedHook(interfaceName: String) = $$"""
                                                 } catch(e) {}
                                                 try {
                                                     window.__japscanSeen = (window.__japscanSeen || 0) + 1;
-                                                    if (window.__japscanSeen <= 3 || window.__japscanSeen % 25 === 0) {
-                                                        window.__jlog('[japscan] page ' + window.__japscanSeen +
-                                                            ' blob type=' + obj.type + ' size=' + obj.size);
+                                                    if (true) {
+                                                        var cp = document.getElementById('current_page');
+                                                    window.__jlog('[japscan] page ' + window.__japscanSeen +
+                                                            ' blob type=' + obj.type + ' size=' + obj.size +
+                                                            ' indicator=' + (cp ? (cp.textContent || '').trim() : 'none'));
                                                     }
                                                 } catch(e) {}
                                             }

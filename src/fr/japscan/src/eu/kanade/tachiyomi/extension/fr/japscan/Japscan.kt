@@ -1,8 +1,6 @@
 package eu.kanade.tachiyomi.extension.fr.japscan
 
 import android.annotation.SuppressLint
-import android.content.ComponentName
-import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
@@ -10,7 +8,6 @@ import android.util.Base64
 import android.util.Log
 import android.view.View
 import android.webkit.ConsoleMessage
-import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -34,7 +31,6 @@ import keiyoushi.source.SMangaUpdate
 import keiyoushi.utils.applicationContext
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferencesLazy
-import keiyoushi.utils.runWebView
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParseDate
 import kotlinx.coroutines.CancellationException
@@ -76,7 +72,6 @@ import java.util.Locale
 import java.util.UUID
 import kotlin.coroutines.resume
 import kotlin.time.Duration.Companion.hours
-import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeSource
@@ -395,13 +390,9 @@ abstract class Japscan :
             completed = retry.second
         }
         if (captured.isEmpty() && readerJsInterface.cloudflareSeen) {
-            // A Cloudflare challenge cannot be answered by a detached WebView: hand it to the same
-            // visible window the app would use, then try again.
-            Log.w("JapscanReader", "Cloudflare challenge in the WebView, asking the user to clear it")
-            askUserForWebViewCaptcha(chapterUrl, isReader)
-            val afterChallenge = capturePages(chapterUrl, urlSegment, isWebtoon)
-            captured = afterChallenge.first
-            completed = afterChallenge.second
+            // Nothing here opens a window: the retries below reload the chapter, and a challenge
+            // the browser passes on its own is passed on the next load.
+            Log.w("JapscanReader", "Cloudflare challenge seen in the capture WebView, retrying")
         }
         // A rate limit is not a captcha nobody can solve: the site simply refuses validations for
         // a minute, and waiting is both the transparent answer and the only one that does not
@@ -426,12 +417,15 @@ abstract class Japscan :
             }
         }
         if (captured.isEmpty() && readerJsInterface.captchaSeen) {
-            // Only a visible WebView can clear what is left.
-            Log.w("JapscanReader", "captcha still up after $captchaRounds rounds, asking the user to solve it")
-            askUserForWebViewCaptcha(chapterUrl, isReader)
-            val afterUser = capturePages(chapterUrl, urlSegment, isWebtoon)
-            captured = afterUser.first
-            completed = afterUser.second
+            // No window for this one either: the captcha is a POST away, so a fresh puzzle and the
+            // solver are tried again instead of handing the work to the user.
+            Log.w("JapscanReader", "captcha still up after $captchaRounds rounds, retrying the solver")
+            val captchaHtml = readerJsInterface.captchaPageHtml
+            if (captchaHtml != null && solveChallengeFromHtml(captchaHtml, chapterUrl)) {
+                val afterSolve = capturePages(chapterUrl, urlSegment, isWebtoon)
+                captured = afterSolve.first
+                completed = afterSolve.second
+            }
         }
         // The site intermittently serves the reader with an empty page list: the HTML is the real
         // chapter page, but it carries no pages and no third-party script. Nothing on our side
@@ -484,62 +478,6 @@ abstract class Japscan :
             }
         }
         return captured.mapIndexed { i, path -> Page(i, imageUrl = "https://$CACHE_HOST$path") }
-    }
-
-    private fun openCaptchaWebView(chapterUrl: String) {
-        val context = applicationContext
-        try {
-            val intent = Intent().apply {
-                component = ComponentName(context, "eu.kanade.tachiyomi.ui.webview.WebViewActivity")
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                putExtra("url_key", chapterUrl)
-                putExtra("source_key", id)
-                putExtra("title_key", "Résolvez le captcha, fermez la Webview et réouvrez le chapitre.")
-            }
-            context.startActivity(intent)
-        } catch (_: Exception) {
-            // Suwayomi etc.
-            throw Exception("Résolvez le captcha de ce chapitre depuis la WebView et réouvrez le chapitre.")
-        }
-    }
-
-    /**
-     * Last resort: the site captcha that only a real WebView sees survived every automatic attempt,
-     * so open the visible WebView and give the user a moment before retrying.
-     */
-    private suspend fun askUserForWebViewCaptcha(chapterUrl: String, isReader: Boolean) {
-        warmupWebViewSession()
-        openCaptchaWebView(chapterUrl)
-        delay(CAPTCHA_WEBVIEW_WAIT)
-        // The clearance the user earned has to reach the cookie store the capture WebView reads
-        // from, or the next attempt starts on the challenge again.
-        runCatching { CookieManager.getInstance().flush() }
-        // Leaving the WebView on screen once the challenge is cleared is just in the way.
-        closeVisibleWebView(isReader)
-        // Cloudflare commits its cookie just after the page settles; retrying instantly is what
-        // made a freshly cleared challenge look like an empty chapter.
-        delay(2.seconds)
-    }
-
-    private fun closeVisibleWebView(isReader: Boolean) {
-        val context = applicationContext
-        runCatching {
-            val target = if (isReader) {
-                "eu.kanade.tachiyomi.ui.reader.ReaderActivity"
-            } else {
-                "eu.kanade.tachiyomi.ui.main.MainActivity"
-            }
-            context.startActivity(
-                Intent().apply {
-                    component = ComponentName(context, target)
-                    addFlags(
-                        Intent.FLAG_ACTIVITY_NEW_TASK or
-                            Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                            Intent.FLAG_ACTIVITY_SINGLE_TOP,
-                    )
-                },
-            )
-        }.onFailure { Log.d("JapscanReader", "could not close the visible WebView: ${it.message}") }
     }
 
     /**
@@ -601,18 +539,6 @@ abstract class Japscan :
             if (System.currentTimeMillis() < captchaBlockedUntil) return false
         }
         return false
-    }
-
-    private suspend fun warmupWebViewSession() {
-        runCatchingCancellable {
-            runWebView<Unit>(timeout = 8.seconds) {
-                var finished = false
-                onPageFinished { finished = true }
-                // Settle window that lets Cloudflare's beacon commit cf_clearance before teardown
-                poll(200.milliseconds) { if (finished) resolve(Unit) }
-                loadUrl("$baseUrl/")
-            }
-        }
     }
 
     /**
@@ -1268,9 +1194,6 @@ abstract class Japscan :
 
         /** Fresh captchas tried (by reloading the chapter) before handing over to the user. */
         private const val CAPTCHA_REFRESH_ATTEMPTS = 3
-
-        /** Time given to the user to clear a captcha that only the WebView shows. */
-        private val CAPTCHA_WEBVIEW_WAIT = 25.seconds
 
         // Under ~1280px wide the long-strip reader lazy-loads tiles on scroll, which a detached
         // WebView can't trigger; above it every tile host is created upfront.
