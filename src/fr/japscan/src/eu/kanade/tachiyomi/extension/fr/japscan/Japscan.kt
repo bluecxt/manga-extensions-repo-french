@@ -508,6 +508,87 @@ abstract class Japscan :
      * @return Absolute paths of the spooled pages, or `null` when this chapter has to go through
      * the WebView (captcha the solver could not answer, no page config, unknown reader build).
      */
+    // Downloads the chapter images from inside the page, in the order of [paths].
+    //
+    // Cloudflare refuses a bare HTTP client but accepts the same request from a browser session,
+    // which is what the reader itself uses. One fetch per URL runs in the page, several at a time,
+    // and each image is uploaded to the loopback receiver under its index in [paths]: the order
+    // comes from the decrypted list, not from the order the browser answered in.
+    private suspend fun browserFetchPages(paths: List<String>, chapterUrl: String): List<String>? {
+        if (paths.isEmpty()) return null
+        val cacheBuster = (System.currentTimeMillis() and 0xFFFF).toString(16)
+        val urls = paths.map { httpCapture.url(it, cacheBuster) }
+        val receiver = PageReceiver(applicationContext.cacheDir)
+        try {
+            val status = withTimeoutOrNull(BROWSER_FETCH_TIMEOUT) {
+                runWebView(timeout = BROWSER_FETCH_TIMEOUT) {
+                    headers["User-Agent"]?.let { userAgent = it }
+                    onPageFinished {
+                        evaluateJs(browserFetcherScript(urls, receiver.baseUrl))
+                        poll(500.milliseconds) {
+                            evaluateJs("String(window.__japscanFetchStatus || '')") { value ->
+                                val text = value.trim().trim('"')
+                                if (text.startsWith("ok") || text.startsWith("fail")) {
+                                    Log.d("JapscanReader", "http: page fetch said: $text")
+                                    resolve(text)
+                                }
+                            }
+                        }
+                    }
+                    loadUrl(chapterUrl, headers.toMap())
+                }
+            }
+            if (status == null || !status.startsWith("ok")) return null
+            val received = receiver.snapshot()
+            return received.takeIf { it.size == paths.size }
+        } finally {
+            receiver.close()
+        }
+    }
+
+    // Runs [urls] as parallel fetch calls in the page and uploads each under its index.
+    private fun browserFetcherScript(urls: List<String>, uploadBase: String): String {
+        val json = urls.joinToString(",", "[", "]") { """ + it.replace("\"", "\\\"") + """ }
+        return """
+            (function () {
+              var urls = $json;
+              var base = '$uploadBase';
+              var limit = 6;
+              var next = 0;
+              var failed = [];
+              window.__japscanFetchStatus = '';
+              function worker() {
+                return new Promise(function (done) {
+                  function step() {
+                    var index = next++;
+                    if (index >= urls.length) { done(); return; }
+                    fetch(urls[index], { credentials: 'include' })
+                      .then(function (response) {
+                        if (!response.ok) throw new Error('HTTP ' + response.status);
+                        return response.blob();
+                      })
+                      .then(function (blob) {
+                        if (!blob.size) throw new Error('empty');
+                        return fetch(base + '/page/' + (index + 1), { method: 'POST', body: blob })
+                          .then(function (up) { if (!up.ok) throw new Error('upload ' + up.status); });
+                      })
+                      .then(function () { step(); })
+                      .catch(function (error) { failed.push((index + 1) + ':' + error); step(); });
+                  }
+                  step();
+                });
+              }
+              var workers = [];
+              for (var i = 0; i < limit; i++) workers.push(worker());
+              Promise.all(workers).then(function () {
+                window.__japscanFetchStatus = failed.length
+                  ? ('fail ' + failed.length + ' ' + failed.slice(0, 5).join(' | '))
+                  : ('ok ' + urls.length);
+              }).catch(function (error) { window.__japscanFetchStatus = 'fail init ' + error; });
+            })();
+        """.trimIndent()
+    }
+
     // Pages read over HTTP, and whether the chapter is complete enough to be cached.
     private class FastPages(val paths: List<String>, val complete: Boolean)
 
@@ -558,6 +639,15 @@ abstract class Japscan :
         )
         // One missing page out of a hundred is the CDN, not us: the reader path would drop it too.
         if (spool.refused) {
+            // The CDN refuses this client, not the browser: the page can fetch the same URLs with
+            // the fingerprint Cloudflare expects. Each image carries its position in the list, so
+            // the order is exact and no duplicate can shift the chapter.
+            val fetched = runCatchingCancellable { browserFetchPages(paths, chapterUrl) }.getOrNull()
+            if (fetched != null && fetched.size == paths.size) {
+                Log.d("JapscanReader", "http: ${paths.size} pages fetched from the page in ${System.currentTimeMillis() - started}ms")
+                return FastPages(fetched, complete = true)
+            }
+            Log.w("JapscanReader", "http: page fetch got ${fetched?.size ?: 0}/${paths.size}, parking the CDN")
             preferences.edit().putLong(CDN_CLOSED_UNTIL, System.currentTimeMillis() + CDN_CLOSED_MS).apply()
             return null
         }
@@ -1352,6 +1442,9 @@ abstract class Japscan :
 
         /** Pages the CDN may refuse before the WebView takes over again. */
         private const val MAX_MISSING_PAGES = 1
+
+        /** How long the in-page download of a whole chapter may take. */
+        private val BROWSER_FETCH_TIMEOUT = 4.minutes
 
         /** How long the HTTP capture stays parked after a CDN refusal. */
         private const val CDN_CLOSED_UNTIL = "cdn_closed_until"
