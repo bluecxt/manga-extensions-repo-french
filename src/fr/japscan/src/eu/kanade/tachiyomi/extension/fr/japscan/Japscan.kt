@@ -114,6 +114,10 @@ abstract class Japscan :
     @Volatile
     private var redirectedTo: String? = null
 
+    /** Wall clock until which the captcha endpoint refuses validations; 0 when it accepts them. */
+    @Volatile
+    private var captchaBlockedUntil: Long = 0L
+
     // Which same-origin requests the reader makes during the current capture: the page list has to
     // come from one of them, so seeing them (or not) tells a dead script from a blocked endpoint.
     private val seenRequests: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
@@ -386,6 +390,23 @@ abstract class Japscan :
             captured = afterChallenge.first
             completed = afterChallenge.second
         }
+        if (captured.isEmpty() && readerJsInterface.captchaSeen && System.currentTimeMillis() < captchaBlockedUntil) {
+            // A rate limit is not a captcha nobody can solve: the site simply refuses validations
+            // for a minute. Waiting is the transparent answer, and it is also the only one that
+            // does not spend more of the same budget.
+            val wait = captchaBlockedUntil - System.currentTimeMillis()
+            Log.w("JapscanReader", "captcha rate-limited, waiting ${wait / 1000}s before asking the user")
+            delay(wait)
+            val afterWait = capturePages(chapterUrl, urlSegment, isWebtoon)
+            captured = afterWait.first
+            completed = afterWait.second
+            val freshCaptcha = readerJsInterface.captchaPageHtml
+            if (captured.isEmpty() && freshCaptcha != null && solveChallengeFromHtml(freshCaptcha, chapterUrl)) {
+                val afterSolve = capturePages(chapterUrl, urlSegment, isWebtoon)
+                captured = afterSolve.first
+                completed = afterSolve.second
+            }
+        }
         if (captured.isEmpty() && readerJsInterface.captchaSeen) {
             // Only a visible WebView can clear what is left.
             Log.w("JapscanReader", "captcha still up after $captchaRounds rounds, asking the user to solve it")
@@ -522,6 +543,13 @@ abstract class Japscan :
         val answers = runCatching { orderUuidsByImageVerticalityRanked(items, CAPTCHA_ATTEMPTS) }
             .getOrDefault(emptyList())
         if (answers.isEmpty()) return false
+        // The site counts every validation, right or wrong, and answers `too_many_requests` once a
+        // budget is spent. Hammering it is what kept a solvable captcha failing: the extension then
+        // jumped straight to the visible WebView, and the whole thing looked broken.
+        if (System.currentTimeMillis() < captchaBlockedUntil) {
+            Log.d("JapscanDebug", "Captcha rate-limited, ${(captchaBlockedUntil - System.currentTimeMillis()) / 1000}s left")
+            return false
+        }
         // The scoring is a heuristic and the site accepts several answers per token: submit the
         // best candidate, then the next best ones, instead of stopping at the first miss.
         for (answer in answers) {
@@ -542,10 +570,17 @@ abstract class Japscan :
                 client.newCall(captchaRequest).execute().use { resp ->
                     val body = resp.body.string()
                     Log.d("JapscanDebug", "Captcha response: $body")
+                    if (CAPTCHA_RATE_LIMIT_REGEX.containsMatchIn(body)) {
+                        captchaBlockedUntil = System.currentTimeMillis() + CAPTCHA_COOLDOWN.inWholeMilliseconds
+                        Log.w("JapscanReader", "captcha rate-limited, pausing ${CAPTCHA_COOLDOWN.inWholeSeconds}s")
+                    }
                     body.contains(CAPTCHA_SUCCESS_REGEX)
                 }
             }.getOrDefault(false)
             if (accepted) return true
+            // A rate limit is not a wrong answer: another candidate, or another puzzle, only spends
+            // more of the same budget.
+            if (System.currentTimeMillis() < captchaBlockedUntil) return false
         }
         return false
     }
@@ -1170,6 +1205,10 @@ abstract class Japscan :
         private val CHAPTER_NUM_REGEX = Regex("""(?i)chapitre\s+([\d.]+)""")
         private val NON_NUMBER_REGEX = Regex("[^0-9.]+")
         private val CAPTCHA_SUCCESS_REGEX = Regex(""""success":\s*true""")
+        private val CAPTCHA_RATE_LIMIT_REGEX = Regex("""too_many_requests|Trop de tentatives""")
+
+        /** How long the site refuses captcha validations after a burst. */
+        private val CAPTCHA_COOLDOWN = 65.seconds
         private val DATE_FORMAT = DateTimeFormatter.ofPattern("d MMM yyyy", Locale.US)
         private val PARIS = ZoneId.of("Europe/Paris")
 
